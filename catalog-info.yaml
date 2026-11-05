@@ -1,0 +1,55 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: fulfillment-adapter
+  description: "Protect the legacy ERP from unreliable upstream and unreliable transport."
+  annotations:
+    github.com/project-slug: box1-org/fulfillment-adapter
+    backstage.io/kubernetes-id: fulfillment-adapter
+    backstage.io/techdocs-ref: dir:.
+    backstage.io/source-location: url:https://github.com/box1-org/fulfillment-adapter/
+    janus-idp.io/tekton: fulfillment-adapter
+    argocd/instance-name: openshift-gitops
+    argocd/app-selector: backstage.io/kubernetes-id=fulfillment-adapter
+    box1.org/template-version: "1.1.0"
+  tags: [java, quarkus, maven, tekton, gitops]
+  links:
+    - url: https://github.com/box1-org/fulfillment-adapter
+      title: Source Repository
+      icon: github
+    - url: https://fulfillment-adapter-dev.apps.ocp.box1.org/q/swagger-ui/
+      title: Swagger UI — test endpoints
+      icon: code
+    - url: https://fulfillment-adapter-dev.apps.ocp.box1.org/q/openapi
+      title: OpenAPI specification
+      icon: code
+    - url: https://fulfillment-adapter-dev.apps.ocp.box1.org
+      title: Application Route (after first release)
+    - url: https://github.com/box1-org/box1-workloads-dev/tree/main/workloads/fulfillment-adapter
+      title: Desired deployment configuration
+    - url: https://devspaces.apps.ocp.box1.org/#https://github.com/box1-org/fulfillment-adapter
+      title: Open in Dev Spaces
+      icon: code
+    # Add actual service-specific observability URLs
+    # when dashboards and log views exist.
+spec:
+  type: service
+  lifecycle: experimental
+  owner: "user:default/mike4263"
+  # Add when the corresponding System entity exists:
+  # system: box1-demo
+  providesApis:
+    - fulfillment-adapter-api
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: fulfillment-adapter-api
+  description: OpenAPI contract for fulfillment-adapter
+  tags: [quarkus, openapi]
+spec:
+  type: openapi
+  lifecycle: experimental
+  owner: "user:default/mike4263"
+  definition:
+    $text: https://fulfillment-adapter-dev.apps.ocp.box1.org/q/openapi
