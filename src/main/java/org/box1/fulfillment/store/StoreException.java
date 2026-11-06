@@ -18,7 +18,11 @@ public class StoreException extends RuntimeException {
 
     /** The database cannot serve at all. Waiting fixes this, and no event is at fault. */
     public boolean isUnavailable() {
-        return sqlState == null || sqlState.startsWith("08") || sqlState.startsWith("53") || sqlState.startsWith("57P");
+        // 08 connection, 53 resources, 57P shutdown, 28 credentials (e.g. rotated password), 3D missing database,
+        // 25006 read-only primary, 55P03 lock not available: none is the event's fault, and waiting can fix each.
+        return sqlState == null || sqlState.startsWith("08") || sqlState.startsWith("53") || sqlState.startsWith("57P")
+                || sqlState.startsWith("28") || sqlState.startsWith("3D") || "25006".equals(sqlState)
+                || "55P03".equals(sqlState);
     }
 
     /** The data can never be stored: a bad value or a constraint it will always break. Retrying cannot help. */

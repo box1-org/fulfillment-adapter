@@ -9,13 +9,16 @@ import org.apache.camel.component.file.GenericFile;
 import org.apache.camel.component.file.GenericFileFilter;
 import org.apache.camel.model.rest.RestBindingMode;
 import org.box1.fulfillment.AcceptanceService;
-import org.box1.fulfillment.DispatchService;
+import org.box1.fulfillment.backend.Erp1DataFormat;
+import org.box1.fulfillment.backend.HiddenFileSweeper;
+import org.box1.fulfillment.backend.LegacyDispatchService;
 import org.box1.fulfillment.ReconcileService;
-import org.box1.fulfillment.ResultService;
+import org.box1.fulfillment.backend.LegacyResultService;
 import org.box1.fulfillment.domain.FulfillmentCommand;
 import org.box1.fulfillment.erp1.Erp1Exception;
 import org.box1.fulfillment.erp1.Erp1File;
 import org.box1.fulfillment.erp1.Erp1Names;
+import org.box1.fulfillment.erp1.Erp1Reader;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 /**
@@ -33,22 +36,25 @@ public class FulfillmentRoutes extends RouteBuilder {
     static final String CONSUMED_NAME = "box1ConsumedName";
     private static final String JOB = "box1UploadJob";
     private static final String RAW = "box1RawBytes";
+    private static final String UPLOADED = "box1Uploaded";
 
     private final AcceptanceService acceptance;
-    private final DispatchService dispatch;
-    private final ResultService results;
+    private final LegacyDispatchService dispatch;
+    private final LegacyResultService results;
     private final ReconcileService reconcile;
     private final RestHandlers rest;
+    private final HiddenFileSweeper hidden;
     private final boolean sftpEnabled;
 
-    public FulfillmentRoutes(AcceptanceService acceptance, DispatchService dispatch, ResultService results,
-            ReconcileService reconcile, RestHandlers rest,
+    public FulfillmentRoutes(AcceptanceService acceptance, LegacyDispatchService dispatch, LegacyResultService results,
+            ReconcileService reconcile, RestHandlers rest, HiddenFileSweeper hidden,
             @ConfigProperty(name = "fulfillment.sftp.enabled") boolean sftpEnabled) {
         this.acceptance = acceptance;
         this.dispatch = dispatch;
         this.results = results;
         this.reconcile = reconcile;
         this.rest = rest;
+        this.hidden = hidden;
         this.sftpEnabled = sftpEnabled;
     }
 
@@ -61,12 +67,25 @@ public class FulfillmentRoutes extends RouteBuilder {
                 .get("/{fulfillmentRequestId}").id("fulfillment-rest-get").produces("application/json")
                 .to("direct:rest-get");
         rest("/internal/fulfillments")
+                .post("/reconcile").id("fulfillment-rest-reconcile-bulk").produces("application/json")
+                .to("direct:rest-reconcile-bulk")
                 .post("/{fulfillmentRequestId}/reconcile").id("fulfillment-rest-reconcile").produces("application/json")
                 .to("direct:rest-reconcile");
 
-        from("direct:rest-post").routeId("fulfillment-rest").process(rest::post);
-        from("direct:rest-get").routeId("fulfillment-rest-status").process(rest::get);
-        from("direct:rest-reconcile").routeId("fulfillment-rest-operator").process(rest::reconcile);
+        // REST routes only: an unexpected failure never returns a stack trace or echoes request headers. This handler
+        // is deliberately route-scoped; on the file routes a handled exception would move an uncommitted file.
+        from("direct:rest-post").routeId("fulfillment-rest")
+                .onException(Exception.class).handled(true).process(rest::unexpected).end()
+                .process(rest::post);
+        from("direct:rest-get").routeId("fulfillment-rest-status")
+                .onException(Exception.class).handled(true).process(rest::unexpected).end()
+                .process(rest::get);
+        from("direct:rest-reconcile").routeId("fulfillment-rest-operator")
+                .onException(Exception.class).handled(true).process(rest::unexpected).end()
+                .process(rest::reconcile);
+        from("direct:rest-reconcile-bulk").routeId("fulfillment-rest-operator-bulk")
+                .onException(Exception.class).handled(true).process(rest::unexpected).end()
+                .process(rest::reconcileAll);
 
         // Route 1: the single acceptance path. Commits before returning; exceptions propagate to the caller.
         from("direct:accept-command").routeId("fulfillment-accept")
@@ -94,33 +113,47 @@ public class FulfillmentRoutes extends RouteBuilder {
                 .process(e -> e.getMessage().setBody(dispatch.claim()))
                 .split(body())
                     .setProperty(JOB, body())
-                    .doTry()
-                        .process(e -> {
-                            DispatchService.UploadJob job = e.getProperty(JOB, DispatchService.UploadJob.class);
-                            e.getMessage().setHeader(Exchange.FILE_NAME, job.fileName());
-                            e.getMessage().setBody(job.request());
-                        })
-                        .marshal(new Erp1DataFormat())
-                        .to(sftp + "inbound" + auth + "&tempFileName=.${file:onlyname}.tmp&fileExist=Fail"
-                                + "&maximumReconnectAttempts=0&disconnect=true")
-                        .process(e -> dispatch.succeeded(e.getProperty(JOB, DispatchService.UploadJob.class)))
-                    .doCatch(Exception.class)
-                        .process(e -> dispatch.failed(e.getProperty(JOB, DispatchService.UploadJob.class),
-                                e.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class)))
+                    .setProperty(UPLOADED, constant(false))
+                    .filter(e -> !dispatch.skipIfEndpointDown(e.getProperty(JOB, LegacyDispatchService.UploadJob.class)))
+                        // Only the framing and transfer are inside the catch: a failure to record success afterwards
+                        // must not be logged as a transport failure (the file was uploaded).
+                        .doTry()
+                            .process(e -> {
+                                LegacyDispatchService.UploadJob job = e.getProperty(JOB, LegacyDispatchService.UploadJob.class);
+                                e.getMessage().setHeader(Exchange.FILE_NAME, job.fileName());
+                                e.getMessage().setBody(job.request());
+                            })
+                            .marshal(new Erp1DataFormat())
+                            .to(sftp + "inbound" + auth + "&tempFileName=.${file:onlyname}.tmp&fileExist=Fail"
+                                    + "&maximumReconnectAttempts=0&disconnect=true")
+                            .setProperty(UPLOADED, constant(true))
+                        .doCatch(Exception.class)
+                            .process(e -> dispatch.failed(e.getProperty(JOB, LegacyDispatchService.UploadJob.class),
+                                    e.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class)))
+                        .end()
+                        .filter(exchangeProperty(UPLOADED))
+                            .process(e -> dispatch.succeeded(e.getProperty(JOB, LegacyDispatchService.UploadJob.class)))
+                        .end()
                     .end()
-                .end();
+                .end()
+                .process(e -> dispatch.batchDone());
 
         // Route 3: results. The move to consumed/ happens only after the processor's transaction commits; an
         // exception leaves the file in outbound/ for the next poll.
         from(sftp + "outbound" + auth + "&delay={{fulfillment.results.poll-interval-ms}}&initialDelay=4000"
-                + "&exclude=^\\..*\\.tmp$&recursive=false&maxMessagesPerPoll=100&streamDownload=false"
+                + "&exclude=^\\..*\\.tmp$&recursive=false&maxMessagesPerPoll=100&streamDownload=true"
                 + "&move=../consumed/${header." + CONSUMED_NAME + "}&readLock=none&disconnect=false"
                 + "&throwExceptionOnConnectFailed=true&bridgeErrorHandler=true")
                 .routeId("erp-results")
                 .process(e -> {
                     String name = e.getMessage().getHeader(Exchange.FILE_NAME_ONLY, String.class);
-                    e.getMessage().setHeader(CONSUMED_NAME, ResultService.consumedName(safeName(name)));
-                    e.setProperty(RAW, e.getMessage().getBody(byte[].class));
+                    e.getMessage().setHeader(CONSUMED_NAME, LegacyResultService.consumedName(safeName(name)));
+                    // Never read more than ERP1's maximum plus one byte: a huge file is quarantined, not loaded.
+                    try (java.io.InputStream in = e.getMessage().getBody(java.io.InputStream.class)) {
+                        byte[] head = in == null ? new byte[0] : in.readNBytes(Erp1Reader.MAX_FILE_BYTES + 1);
+                        e.setProperty(RAW, head);
+                        e.getMessage().setBody(head);
+                    }
                 })
                 .choice()
                     .when(e -> Erp1Names.classify("outbound", e.getMessage().getHeader(Exchange.FILE_NAME_ONLY, String.class))
@@ -137,6 +170,11 @@ public class FulfillmentRoutes extends RouteBuilder {
                                     + e.getProperty(Exchange.EXCEPTION_CAUGHT, Erp1Exception.class).code().name()))
                         .end()
                 .end();
+
+        // Names starting with a dot are invisible to the route above; ERP1 still requires quarantining them.
+        from("scheduler:hidden-sweep?delay={{fulfillment.results.hidden-sweep-interval-ms}}&initialDelay=10000")
+                .routeId("outbound-hidden-sweep")
+                .process(e -> hidden.sweep());
 
         // Retention: the adapter owns consumed/ and deletes its files after the retention period (D-011).
         from(sftp + "consumed" + auth + "&delay={{fulfillment.consumed.sweep-interval-ms}}&initialDelay=60000"

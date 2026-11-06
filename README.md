@@ -34,6 +34,7 @@ All settings are environment variables; none has a real credential as a default.
 | `FULFILLMENT_JWT_ISSUER`, `FULFILLMENT_JWKS_URL` | Keycloak realm `box1` | token verification; audience `fulfillment-adapter`, role `fulfillment-writer` |
 | `FULFILLMENT_ACK_TIMEOUT_BASE_SECONDS`, `_MAX_SECONDS`, `FULFILLMENT_ACK_MAX_UPLOADS` | 120, 3600, 8 | resend schedule without acknowledgement |
 | `FULFILLMENT_UPLOAD_BACKOFF_BASE_SECONDS`, `_MAX_SECONDS`, `FULFILLMENT_UPLOAD_MAX_ATTEMPTS` | 10, 300, 40 | upload retry bound |
+| `FULFILLMENT_ERR_MAX_RESENDS` | 5 | resends after transport-damage `ERR` files, with backoff |
 | `FULFILLMENT_PROBE_INTERVAL_SECONDS` | 21600 | equivalent-resend probe for acknowledged, unfinished requests |
 | `FULFILLMENT_CONSUMED_RETENTION` | `P7D` | deletion of the adapter's `consumed/` files |
 

@@ -20,13 +20,14 @@ import com.networknt.schema.ValidationMessage;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.box1.fulfillment.backend.LegacyResultService;
 import org.box1.fulfillment.erp1.Erp1File;
 import org.box1.fulfillment.erp1.Erp1Reader;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * ERP1 section 7 through the persistent consumer (ResultService and PostgreSQL), using the pinned contract fixtures
+ * ERP1 section 7 through the persistent consumer (LegacyResultService and PostgreSQL), using the pinned contract fixtures
  * unchanged, plus ERR handling and the published outcome events checked against the pinned event schemas.
  */
 @QuarkusTest
@@ -36,7 +37,7 @@ class ResultIngestionTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     @Inject
-    ResultService results;
+    LegacyResultService results;
 
     @BeforeEach
     void clean() {
@@ -60,7 +61,7 @@ class ResultIngestionTest {
     private String deliver(String fixture, String name) throws Exception {
         byte[] bytes = Contracts.bytes(FIX + fixture);
         Erp1File file = Erp1Reader.read(bytes, name);
-        return results.ingest(file, bytes, name, ResultService.consumedName(name));
+        return results.ingest(file, bytes, name, LegacyResultService.consumedName(name));
     }
 
     private JsonNode manifest() throws Exception {
@@ -170,6 +171,38 @@ class ResultIngestionTest {
     }
 
     @Test
+    void repeatedTransportErrsAreBoundedWithBackoff() throws Exception {
+        // Review finding P1: upload, ERR, upload, ERR... must end in needs-attention, not loop.
+        sent("ful_1042", "ord_1042");
+        for (int i = 1; i <= 5; i++) {
+            String name = "REQ.ful_1042.0a1b2c3" + i + ".erp1";
+            Db.exec("INSERT INTO upload (file_name, nonce, fulfillment_request_id, state, reason) VALUES (?, ?, 'ful_1042',"
+                    + " 'UPLOADED', 'ERR_RESEND')", name, "0a1b2c3" + i);
+            // A successful upload in between resets the transport-failure counter; the ERR budget must survive it.
+            Db.exec("UPDATE fulfillment_request SET failed_upload_attempts = 0, dispatch_state = 'UPLOADED'"
+                    + " WHERE fulfillment_request_id = 'ful_1042' AND dispatch_state = 'QUEUED'");
+            assertEquals("ERR", ingestErr("err_" + Integer.toString(i).repeat(32), name, "ENCODING"));
+            if (i < 5) {
+                assertEquals("QUEUED", Db.one("SELECT dispatch_state FROM fulfillment_request WHERE fulfillment_request_id = 'ful_1042'"));
+                assertTrue((Boolean) Db.one("SELECT next_attempt_at > now() FROM fulfillment_request"
+                        + " WHERE fulfillment_request_id = 'ful_1042'"), "ERR resend is backed off");
+            }
+        }
+        assertEquals("ERR_RESENDS_EXHAUSTED",
+                Db.one("SELECT needs_attention_reason FROM fulfillment_request WHERE fulfillment_request_id = 'ful_1042'"));
+    }
+
+    @Test
+    void aFailedMoveDoesNotMultiplyQuarantineRecords() {
+        byte[] bad = "hello\n".getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < 3; i++) {
+            results.quarantine("again.txt", "again.txt.0123456789abcde" + i, bad, bad.length, "UNEXPECTED_NAME");
+        }
+        assertEquals(1L, Db.one("SELECT count(*) FROM erp_file_receipt WHERE file_name = 'again.txt'"));
+        Db.exec("DELETE FROM erp_file_receipt WHERE file_name = 'again.txt'");
+    }
+
+    @Test
     void conflictingReuseFixtureNeedsAttentionAndStaysThereAfterResults() throws Exception {
         sent("ful_1042", "ord_1042");
         Db.exec("INSERT INTO upload (file_name, nonce, fulfillment_request_id, state, reason)"
@@ -197,7 +230,7 @@ class ResultIngestionTest {
         String name = "ERR." + errorId + ".erp1";
         byte[] bytes = ("HDR|ERP1|ERR|2026-11-05T22:00:00.000Z\nERR|" + errorId + "|" + inboundName + "|"
                 + inboundName.split("\\.")[1] + "|" + code + "|test detail\nTRL|3\n").getBytes(StandardCharsets.UTF_8);
-        return results.ingest(Erp1Reader.read(bytes, name), bytes, name, ResultService.consumedName(name));
+        return results.ingest(Erp1Reader.read(bytes, name), bytes, name, LegacyResultService.consumedName(name));
     }
 
     private static JsonNode published(String id, String type) {

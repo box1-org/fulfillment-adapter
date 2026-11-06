@@ -1,4 +1,6 @@
-package org.box1.fulfillment;
+package org.box1.fulfillment.backend;
+
+import org.box1.fulfillment.FulfillmentMetrics;
 
 import java.time.Instant;
 import java.util.List;
@@ -6,7 +8,6 @@ import java.util.Set;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.transaction.Transactional;
-import org.box1.fulfillment.backend.LegacyErp1Backend;
 import org.box1.fulfillment.erp1.Erp1ErrorCode;
 import org.box1.fulfillment.erp1.Erp1File;
 import org.box1.fulfillment.erp1.Erp1FileType;
@@ -25,8 +26,8 @@ import org.jboss.logging.MDC;
  * rename the file to {@code consumed/}. A crash between the two redelivers the file, which deduplicates.
  */
 @ApplicationScoped
-public class ResultService {
-    private static final Logger LOG = Logger.getLogger(ResultService.class);
+public class LegacyResultService {
+    private static final Logger LOG = Logger.getLogger(LegacyResultService.class);
     /** ERR codes that mean transport damage or permissions; the adapter self-validates every file it sends (D-005). */
     private static final Set<Erp1ErrorCode> RESENDABLE =
             Set.of(Erp1ErrorCode.TRUNCATED, Erp1ErrorCode.COUNT_MISMATCH, Erp1ErrorCode.ENCODING, Erp1ErrorCode.UNREADABLE);
@@ -35,16 +36,22 @@ public class ResultService {
     private final EventFactory events;
     private final FulfillmentMetrics metrics;
     private final long probeSeconds;
-    private final int uploadMaxAttempts;
+    private final int maxErrResends;
+    private final long errBackoffBase;
+    private final long errBackoffMax;
 
-    public ResultService(FulfillmentStore store, EventFactory events, FulfillmentMetrics metrics,
+    public LegacyResultService(FulfillmentStore store, EventFactory events, FulfillmentMetrics metrics,
             @ConfigProperty(name = "fulfillment.ack.probe-interval-seconds") long probeSeconds,
-            @ConfigProperty(name = "fulfillment.upload.max-attempts") int uploadMaxAttempts) {
+            @ConfigProperty(name = "fulfillment.err.max-resends") int maxErrResends,
+            @ConfigProperty(name = "fulfillment.upload.backoff-base-seconds") long errBackoffBase,
+            @ConfigProperty(name = "fulfillment.upload.backoff-max-seconds") long errBackoffMax) {
         this.store = store;
         this.events = events;
         this.metrics = metrics;
         this.probeSeconds = probeSeconds;
-        this.uploadMaxAttempts = uploadMaxAttempts;
+        this.maxErrResends = maxErrResends;
+        this.errBackoffBase = errBackoffBase;
+        this.errBackoffMax = errBackoffMax;
     }
 
     /** The name a processed file is moved to, with a fresh nonce so re-emitted files never collide. */
@@ -56,9 +63,10 @@ public class ResultService {
     @Transactional
     public void quarantine(String fileName, String consumedName, byte[] bytes, long size, String reason) {
         byte[] kept = bytes != null && bytes.length <= Erp1Reader.MAX_FILE_BYTES ? bytes : null;
-        store.receipt(fileName, consumedName, null, "QUARANTINE", reason, size, kept);
-        metrics.quarantined(reason);
-        LOG.warnv("Quarantined an outbound file: reason={0} size={1}", reason, size);
+        if (store.receipt(fileName, consumedName, null, "QUARANTINE", reason, size, kept, sha256(bytes))) {
+            metrics.quarantined(reason);
+            LOG.warnv("Quarantined an outbound file: reason={0} size={1}", reason, size);
+        }
     }
 
     /** A valid RES or ERR file. Returns the receipt outcome. */
@@ -98,19 +106,20 @@ public class ResultService {
         Instant statusAt = Instant.parse(res.get("statusAt"));
         switch (decision.outcome()) {
             case QUARANTINE -> {
-                store.receipt(fileName, consumedName, locked == null ? null : id, "QUARANTINE", decision.reason(),
-                        bytes.length, bytes);
-                metrics.quarantined(decision.reason());
+                if (store.receipt(fileName, consumedName, locked == null ? null : id, "QUARANTINE", decision.reason(),
+                        bytes.length, bytes, sha256(bytes))) {
+                    metrics.quarantined(decision.reason());
+                }
                 LOG.warnv("Quarantined a result: reason={0} revision={1}", decision.reason(), revision);
             }
             case DUPLICATE -> {
-                store.receipt(fileName, consumedName, id, "DUPLICATE", null, bytes.length, null);
+                store.receipt(fileName, consumedName, id, "DUPLICATE", null, bytes.length, null, sha256(bytes));
                 LOG.infov("Duplicate result ignored: revision={0}", revision);
             }
             case LATE -> {
                 store.insertResult(id, res.get("resultId"), revision, status, res.get("shipmentId"), statusAt,
                         res.get("reasonCode"), bytes, "LATE", fileName);
-                store.receipt(fileName, consumedName, id, "LATE", null, bytes.length, null);
+                store.receipt(fileName, consumedName, id, "LATE", null, bytes.length, null, sha256(bytes));
                 LOG.infov("Late result recorded without changing state: revision={0} status={1} applied={2}", revision,
                         status, locked.appliedRevision());
             }
@@ -127,7 +136,7 @@ public class ResultService {
         store.insertResult(id, res.get("resultId"), revision, status, res.get("shipmentId"), statusAt, res.get("reasonCode"),
                 bytes, "APPLY", fileName);
         store.applyResult(id, revision, status, res.get("shipmentId"), statusAt, res.get("reasonCode"), probeSeconds);
-        store.receipt(fileName, consumedName, id, "APPLY", null, bytes.length, null);
+        store.receipt(fileName, consumedName, id, "APPLY", null, bytes.length, null, sha256(bytes));
         Instant now = Instant.now();
         String eventId = null;
         if ("SHIPPED".equals(status)) {
@@ -167,20 +176,20 @@ public class ResultService {
         }
         String id = ref == null ? null : ref.fulfillmentRequestId();
         if (!store.insertError(errorId, inbound, id, code.name(), action)) {
-            store.receipt(fileName, consumedName, id, "DUPLICATE", null, bytes.length, null);
+            store.receipt(fileName, consumedName, id, "DUPLICATE", null, bytes.length, null, sha256(bytes));
             return "DUPLICATE";
         }
-        store.receipt(fileName, consumedName, id, "ERR", code.name(), bytes.length, bytes);
+        store.receipt(fileName, consumedName, id, "ERR", code.name(), bytes.length, bytes, sha256(bytes));
         if (id != null) {
             MDC.put("fulfillmentRequestId", id);
         }
         try {
             switch (action) {
                 case "RESEND" -> {
-                    boolean exhausted = store.errResend(id, code.name(), uploadMaxAttempts);
+                    boolean exhausted = store.errResend(id, code.name(), maxErrResends, errBackoffBase, errBackoffMax);
                     metrics.resend("ERR_RESEND");
                     if (exhausted) {
-                        metrics.needsAttention("UPLOAD_EXHAUSTED");
+                        metrics.needsAttention("ERR_RESENDS_EXHAUSTED");
                     }
                 }
                 case "NEEDS_ATTENTION" -> {
@@ -198,5 +207,15 @@ public class ResultService {
             MDC.remove("fulfillmentRequestId");
         }
         return "ERR";
+    }
+
+    /** Hex SHA-256 of what was read (at most the ERP1 maximum plus one byte). */
+    static String sha256(byte[] bytes) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(bytes == null ? new byte[0] : bytes));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 }

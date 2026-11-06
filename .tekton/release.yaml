@@ -152,13 +152,22 @@ spec:
             #!/usr/bin/env python3
             import json, urllib.error, urllib.request
             base = 'https://fulfillment-adapter-dev.apps.ocp.box1.org'
-            def call(path, method='GET', data=None, headers=None):
+            def call_once(path, method='GET', data=None, headers=None):
                 request = urllib.request.Request(base + path, data=data, headers=headers or {}, method=method)
                 try:
                     with urllib.request.urlopen(request, timeout=20) as response:
                         return response.status, response.read().decode()
                 except urllib.error.HTTPError as error:
                     return error.code, error.read().decode()
+            def call(path, method='GET', data=None, headers=None):
+                # A rollout can briefly answer 502-504 from the Route; retry those for up to 120 s, as the shared smoke does.
+                import time
+                deadline = time.time() + 120
+                while True:
+                    status, text = call_once(path, method, data, headers)
+                    if status not in (502, 503, 504) or time.time() > deadline:
+                        return status, text
+                    time.sleep(5)
             body = json.dumps({'fulfillmentRequestId': 'ful_smoke', 'orderId': 'ord_smoke', 'reservationId': 'res_smoke',
                                'siteId': 'site_smoke', 'sku': 'SMOKE', 'quantity': 1}).encode()
             # Anonymous callers can never create fulfillments through the Route.

@@ -105,11 +105,11 @@ public class FulfillmentStore {
 
     /** Claim due uploads under a lease. A crashed claimer's lease expires and the rows become due again. */
     @Transactional(Transactional.TxType.REQUIRES_NEW)
-    public List<Due> claimDueUploads(String owner, int limit, int leaseSeconds) {
+    public List<Due> claimDueUploads(String backend, String owner, int limit, int leaseSeconds) {
         String sql = """
                 WITH c AS (
                     SELECT fulfillment_request_id FROM fulfillment_request
-                    WHERE dispatch_state = 'QUEUED' AND next_attempt_at <= now()
+                    WHERE backend = ? AND dispatch_state = 'QUEUED' AND next_attempt_at <= now()
                       AND (claim_expires_at IS NULL OR claim_expires_at < now())
                     ORDER BY next_attempt_at LIMIT ? FOR UPDATE SKIP LOCKED)
                 UPDATE fulfillment_request f SET claimed_by = ?, claim_expires_at = now() + make_interval(secs => ?)
@@ -119,9 +119,10 @@ public class FulfillmentStore {
                     f.failed_upload_attempts
                 """;
         try (Connection conn = dataSource.getConnection(); PreparedStatement s = conn.prepareStatement(sql)) {
-            s.setInt(1, limit);
-            s.setString(2, owner);
-            s.setInt(3, leaseSeconds);
+            s.setString(1, backend);
+            s.setInt(2, limit);
+            s.setString(3, owner);
+            s.setInt(4, leaseSeconds);
             List<Due> due = new ArrayList<>();
             try (ResultSet r = s.executeQuery()) {
                 while (r.next()) {
@@ -181,7 +182,10 @@ public class FulfillmentStore {
         }
     }
 
-    /** The upload failed. Retry after the backoff, or stop at the bound and ask for attention. */
+    /**
+     * The upload failed. Retry after the backoff, or stop at the bound and ask for attention. Only a request still
+     * QUEUED is changed: a result applied meanwhile, or a needs-attention set meanwhile, is never overwritten.
+     */
     @Transactional(Transactional.TxType.REQUIRES_NEW)
     public boolean uploadFailed(String id, String fileName, String owner, String error, long backoffSeconds, int maxAttempts) {
         exec("UPDATE upload SET state = 'FAILED', finished_at = now(), error = ? WHERE file_name = ?", error, fileName);
@@ -193,7 +197,7 @@ public class FulfillmentStore {
                 + "   ELSE now() + make_interval(secs => ?) END,"
                 + " pending_upload_reason = CASE WHEN failed_upload_attempts + 1 >= ? THEN pending_upload_reason ELSE 'RETRY' END,"
                 + " claimed_by = NULL, claim_expires_at = NULL, updated_at = now()"
-                + " WHERE fulfillment_request_id = ? AND claimed_by = ? RETURNING dispatch_state";
+                + " WHERE fulfillment_request_id = ? AND claimed_by = ? AND dispatch_state = 'QUEUED' RETURNING dispatch_state";
         try (Connection conn = dataSource.getConnection(); PreparedStatement s = conn.prepareStatement(sql)) {
             s.setString(1, error);
             s.setInt(2, maxAttempts);
@@ -204,11 +208,27 @@ public class FulfillmentStore {
             s.setString(7, id);
             s.setString(8, owner);
             try (ResultSet r = s.executeQuery()) {
-                return r.next() && "NEEDS_ATTENTION".equals(r.getString(1));
+                boolean exhausted = r.next() && "NEEDS_ATTENTION".equals(r.getString(1));
+                releaseClaim(id, owner);
+                return exhausted;
             }
         } catch (SQLException e) {
             throw new StoreException(e);
         }
+    }
+
+    /** Give a claimed request back without spending an attempt (the endpoint is known to be down this batch). */
+    @Transactional(Transactional.TxType.REQUIRES_NEW)
+    public void releaseUnattempted(String id, String fileName, String owner, long delaySeconds) {
+        exec("DELETE FROM upload WHERE file_name = ? AND state = 'STARTED'", fileName);
+        exec("UPDATE fulfillment_request SET next_attempt_at = now() + make_interval(secs => ?), claimed_by = NULL,"
+                + " claim_expires_at = NULL WHERE fulfillment_request_id = ? AND claimed_by = ? AND dispatch_state = 'QUEUED'",
+                delaySeconds, id, owner);
+    }
+
+    private void releaseClaim(String id, String owner) {
+        exec("UPDATE fulfillment_request SET claimed_by = NULL, claim_expires_at = NULL"
+                + " WHERE fulfillment_request_id = ? AND claimed_by = ?", id, owner);
     }
 
     // ---------------------------------------------------------------- reconciliation
@@ -253,9 +273,33 @@ public class FulfillmentStore {
     @Transactional(Transactional.TxType.MANDATORY)
     public boolean operatorRequeue(String id) {
         return exec("UPDATE fulfillment_request SET dispatch_state = 'QUEUED', next_attempt_at = now(),"
-                + " pending_upload_reason = 'OPERATOR', failed_upload_attempts = 0, unacknowledged_uploads = 0,"
+                + " pending_upload_reason = 'OPERATOR', failed_upload_attempts = 0, unacknowledged_uploads = 0, err_resends = 0,"
                 + " needs_attention_reason = NULL, updated_at = now()"
                 + " WHERE fulfillment_request_id = ? AND dispatch_state = 'NEEDS_ATTENTION'", id) == 1;
+    }
+
+    /** Bulk operator restart of needs-attention requests with one transport reason. Returns the IDs requeued. */
+    @Transactional(Transactional.TxType.MANDATORY)
+    public List<String> operatorRequeueByReason(String reason, int limit) {
+        String sql = "UPDATE fulfillment_request SET dispatch_state = 'QUEUED', next_attempt_at = now(),"
+                + " pending_upload_reason = 'OPERATOR', failed_upload_attempts = 0, unacknowledged_uploads = 0, err_resends = 0,"
+                + " needs_attention_reason = NULL, updated_at = now() WHERE fulfillment_request_id IN ("
+                + " SELECT fulfillment_request_id FROM fulfillment_request WHERE dispatch_state = 'NEEDS_ATTENTION'"
+                + " AND needs_attention_reason = ? ORDER BY updated_at LIMIT ? FOR UPDATE SKIP LOCKED)"
+                + " RETURNING fulfillment_request_id";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement s = conn.prepareStatement(sql)) {
+            s.setString(1, reason);
+            s.setInt(2, limit);
+            List<String> ids = new ArrayList<>();
+            try (ResultSet r = s.executeQuery()) {
+                while (r.next()) {
+                    ids.add(r.getString(1));
+                }
+            }
+            return ids;
+        } catch (SQLException e) {
+            throw new StoreException(e);
+        }
     }
 
     @Transactional(Transactional.TxType.MANDATORY)
@@ -331,6 +375,7 @@ public class FulfillmentStore {
         // A CONFLICTING_REUSE stays in needs-attention: the ERP holds a different request under this ID.
         String sql = "UPDATE fulfillment_request SET applied_revision = ?, erp_status = ?, shipment_id = ?, status_at = ?,"
                 + " reason_code = ?, acknowledged_at = COALESCE(acknowledged_at, now()), unacknowledged_uploads = 0,"
+                + " failed_upload_attempts = 0, err_resends = 0,"
                 + " needs_attention_reason = CASE WHEN needs_attention_reason = 'CONFLICTING_REUSE'"
                 + "   THEN needs_attention_reason ELSE NULL END,"
                 + " dispatch_state = CASE WHEN needs_attention_reason = 'CONFLICTING_REUSE' THEN 'NEEDS_ATTENTION'"
@@ -354,10 +399,13 @@ public class FulfillmentStore {
         }
     }
 
+    /** Record a processed file once per (name, bytes, outcome). False when already recorded (a repeated delivery). */
     @Transactional(Transactional.TxType.MANDATORY)
-    public void receipt(String fileName, String consumedName, String id, String outcome, String reason, long size, byte[] bytes) {
+    public boolean receipt(String fileName, String consumedName, String id, String outcome, String reason, long size,
+            byte[] bytes, String sha256) {
         String sql = "INSERT INTO erp_file_receipt (file_name, consumed_name, fulfillment_request_id, outcome, reason,"
-                + " size_bytes, bytes) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                + " size_bytes, bytes, bytes_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                + " ON CONFLICT (file_name, bytes_sha256, outcome) DO NOTHING";
         try (Connection conn = dataSource.getConnection(); PreparedStatement s = conn.prepareStatement(sql)) {
             s.setString(1, fileName);
             s.setString(2, consumedName);
@@ -370,7 +418,8 @@ public class FulfillmentStore {
             } else {
                 s.setBytes(7, bytes);
             }
-            s.executeUpdate();
+            s.setString(8, sha256);
+            return s.executeUpdate() == 1;
         } catch (SQLException e) {
             throw new StoreException(e);
         }
@@ -400,21 +449,27 @@ public class FulfillmentStore {
                 + " VALUES (?, ?, ?, ?, ?) ON CONFLICT (error_id) DO NOTHING", errorId, inboundFileName, id, code, action) == 1;
     }
 
-    /** An ERR on an unacknowledged upload: count the failed transfer and resend, or stop at the bound. */
+    /**
+     * An ERR on an unacknowledged upload: resend after a backoff, bounded by its own counter, which a successful
+     * upload never resets. Without that, upload-then-ERR would loop forever (review finding P1).
+     */
     @Transactional(Transactional.TxType.MANDATORY)
-    public boolean errResend(String id, String code, int maxAttempts) {
-        String sql = "UPDATE fulfillment_request SET failed_upload_attempts = failed_upload_attempts + 1, last_error = ?,"
-                + " dispatch_state = CASE WHEN failed_upload_attempts + 1 >= ? THEN 'NEEDS_ATTENTION' ELSE 'QUEUED' END,"
-                + " needs_attention_reason = CASE WHEN failed_upload_attempts + 1 >= ? THEN 'UPLOAD_EXHAUSTED' ELSE NULL END,"
-                + " next_attempt_at = CASE WHEN failed_upload_attempts + 1 >= ? THEN NULL ELSE now() END,"
+    public boolean errResend(String id, String code, int maxErrResends, long backoffBaseSeconds, long backoffMaxSeconds) {
+        String sql = "UPDATE fulfillment_request SET err_resends = err_resends + 1, last_error = ?,"
+                + " dispatch_state = CASE WHEN err_resends + 1 >= ? THEN 'NEEDS_ATTENTION' ELSE 'QUEUED' END,"
+                + " needs_attention_reason = CASE WHEN err_resends + 1 >= ? THEN 'ERR_RESENDS_EXHAUSTED' ELSE NULL END,"
+                + " next_attempt_at = CASE WHEN err_resends + 1 >= ? THEN NULL"
+                + "   ELSE now() + make_interval(secs => least(?::double precision, ? * power(2, LEAST(err_resends, 20)))) END,"
                 + " pending_upload_reason = 'ERR_RESEND', resends = resends + 1, updated_at = now()"
                 + " WHERE fulfillment_request_id = ? AND dispatch_state <> 'NEEDS_ATTENTION' RETURNING dispatch_state";
         try (Connection conn = dataSource.getConnection(); PreparedStatement s = conn.prepareStatement(sql)) {
             s.setString(1, "ERR_" + code);
-            s.setInt(2, maxAttempts);
-            s.setInt(3, maxAttempts);
-            s.setInt(4, maxAttempts);
-            s.setString(5, id);
+            s.setInt(2, maxErrResends);
+            s.setInt(3, maxErrResends);
+            s.setInt(4, maxErrResends);
+            s.setLong(5, backoffMaxSeconds);
+            s.setLong(6, backoffBaseSeconds);
+            s.setString(7, id);
             try (ResultSet r = s.executeQuery()) {
                 return r.next() && "NEEDS_ATTENTION".equals(r.getString(1));
             }

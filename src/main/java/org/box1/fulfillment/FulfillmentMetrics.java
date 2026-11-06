@@ -20,6 +20,8 @@ public class FulfillmentMetrics {
 
     private final MeterRegistry registry;
     private final FulfillmentStore store;
+    private final java.util.concurrent.atomic.AtomicLong refreshedAt = new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis());
+    private final io.micrometer.core.instrument.Timer publishLag;
     private final AtomicReference<FulfillmentStore.Gauges> gauges =
             new AtomicReference<>(new FulfillmentStore.Gauges(0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 
@@ -38,6 +40,12 @@ public class FulfillmentMetrics {
         gauge("fulfillment_quarantined_files", "Outbound files quarantined since the database was created", g -> g.quarantined());
         gauge("fulfillment_outbox_pending", "Outcome events not yet confirmed by the broker", g -> g.outboxPending());
         gauge("fulfillment_outbox_oldest_seconds", "Age of the oldest unpublished outcome event", g -> g.outboxOldestSeconds());
+        // The gauges above keep their last value when a refresh fails; this shows how stale they are.
+        Gauge.builder("fulfillment_metrics_refresh_age_seconds", refreshedAt,
+                t -> (System.currentTimeMillis() - t.get()) / 1000.0).description("Seconds since the gauges were refreshed")
+                .register(registry);
+        publishLag = io.micrometer.core.instrument.Timer.builder("fulfillment_outbox_publish_lag")
+                .description("Time from an outcome event's commit to broker confirmation").register(registry);
     }
 
     private void gauge(String name, String help, java.util.function.ToDoubleFunction<FulfillmentStore.Gauges> f) {
@@ -48,6 +56,7 @@ public class FulfillmentMetrics {
     void refresh() {
         try {
             gauges.set(store.gauges());
+            refreshedAt.set(System.currentTimeMillis());
         } catch (RuntimeException e) {
             LOG.warnv("Metric refresh failed: {0}", e.getClass().getSimpleName());
         }
@@ -88,6 +97,7 @@ public class FulfillmentMetrics {
 
     public void published(double lagSeconds) {
         count("fulfillment_outbox_published_total");
+        publishLag.record(java.time.Duration.ofMillis((long) (lagSeconds * 1000)));
     }
 
     public void publishFailed() {

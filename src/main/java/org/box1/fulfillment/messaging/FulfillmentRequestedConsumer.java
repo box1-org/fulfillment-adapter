@@ -82,6 +82,12 @@ public class FulfillmentRequestedConsumer {
         } catch (InvalidCommandException e) {
             reject(record, command.causationId(), command.fulfillmentRequestId(), e.reason());
             throw new PoisonEventException(e.reason(), e.getMessage());
+        } catch (PoisonEventException e) {
+            if (!"CONFLICTING_REUSE".equals(e.reason())) {
+                // Retries exhausted: still a durable record, so the operator can find and replay it.
+                reject(record, command.causationId(), command.fulfillmentRequestId(), e.reason());
+            }
+            throw e;
         } finally {
             MDC.remove("fulfillmentRequestId");
             MDC.remove("orderId");
@@ -108,7 +114,7 @@ public class FulfillmentRequestedConsumer {
                 if (cause instanceof InvalidCommandException invalid) {
                     throw invalid;
                 }
-                boolean unavailable = cause instanceof StoreException store && store.isUnavailable();
+                boolean unavailable = databaseUnavailable(cause);
                 if (!unavailable && attempt >= maxAttempts) {
                     // Fixed text: this reaches dead-letter headers.
                     throw new PoisonEventException("RETRIES_EXHAUSTED", "Retries exhausted");
@@ -125,6 +131,25 @@ public class FulfillmentRequestedConsumer {
                 backoff = Math.min(backoff * 2, maxBackoffMillis);
             }
         }
+    }
+
+    /**
+     * A StoreException with an unavailable state, or a commit-time rollback whose cause is a database failure (raised
+     * by the transaction manager, not the store).
+     */
+    static boolean databaseUnavailable(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause() == t ? null : t.getCause()) {
+            if (t instanceof StoreException store) {
+                return store.isUnavailable();
+            }
+            if (t instanceof java.sql.SQLException sql) {
+                return new StoreException(sql).isUnavailable();
+            }
+            if (t instanceof jakarta.transaction.RollbackException || t instanceof jakarta.transaction.SystemException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void holdForDatabase(Runnable action) {
@@ -156,12 +181,26 @@ public class FulfillmentRequestedConsumer {
         }
     }
 
+    /**
+     * Sleeps through interrupts. Throwing would nack the record and dead-letter a valid event during shutdown; instead
+     * the process ends without committing the offset, and the record is redelivered.
+     */
     private static void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
+        long end = System.nanoTime() + millis * 1_000_000L;
+        boolean interrupted = false;
+        while (true) {
+            long left = end - System.nanoTime();
+            if (left <= 0) {
+                break;
+            }
+            try {
+                Thread.sleep(left / 1_000_000L, (int) (left % 1_000_000L));
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted during retry", e);
         }
     }
 }

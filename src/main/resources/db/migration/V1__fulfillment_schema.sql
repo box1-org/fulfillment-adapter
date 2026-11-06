@@ -21,11 +21,14 @@ CREATE TABLE fulfillment_request (
                             CHECK (dispatch_state IN ('QUEUED', 'UPLOADED', 'NEEDS_ATTENTION')),
     next_attempt_at         timestamptz,
     -- Why the next upload is due: FIRST, RETRY, NO_ACK, PROBE, ERR_RESEND or OPERATOR.
-    pending_upload_reason   varchar(16)  DEFAULT 'FIRST',
+    pending_upload_reason   varchar(16)  DEFAULT 'FIRST'
+                            CHECK (pending_upload_reason IN ('FIRST', 'RETRY', 'NO_ACK', 'PROBE', 'ERR_RESEND', 'OPERATOR')),
     failed_upload_attempts  integer      NOT NULL DEFAULT 0,
     unacknowledged_uploads  integer      NOT NULL DEFAULT 0,
     total_uploads           integer      NOT NULL DEFAULT 0,
     resends                 integer      NOT NULL DEFAULT 0,
+    -- ERR-driven resends since the last acknowledgement; never reset by a successful upload.
+    err_resends             integer      NOT NULL DEFAULT 0,
     last_upload_at          timestamptz,
     last_error              varchar(64),
     needs_attention_reason  varchar(64),
@@ -62,7 +65,7 @@ CREATE TABLE erp_result (
     fulfillment_request_id  varchar(128) NOT NULL REFERENCES fulfillment_request,
     result_id               varchar(36)  NOT NULL,
     revision                integer      NOT NULL,
-    status                  varchar(8)   NOT NULL,
+    status                  varchar(8)   NOT NULL CHECK (status IN ('PENDING', 'HELD', 'SHIPPED', 'REJECTED')),
     shipment_id             varchar(128),
     status_at               timestamptz  NOT NULL,
     reason_code             varchar(32),
@@ -93,9 +96,12 @@ CREATE TABLE erp_file_receipt (
     outcome                 varchar(10)  NOT NULL CHECK (outcome IN ('APPLY', 'LATE', 'DUPLICATE', 'QUARANTINE', 'ERR')),
     reason                  varchar(64),
     size_bytes              bigint       NOT NULL,
+    bytes_sha256            char(64)     NOT NULL,
     bytes                   bytea,
     received_at             timestamptz  NOT NULL DEFAULT now()
 );
+-- A file processed again because its move to consumed/ failed is recorded once per outcome.
+CREATE UNIQUE INDEX ux_receipt_once ON erp_file_receipt (file_name, bytes_sha256, outcome);
 CREATE INDEX ix_receipt_quarantine ON erp_file_receipt (received_at) WHERE outcome = 'QUARANTINE';
 
 -- Kafka records that could not be accepted (poison or conflicting reuse), recorded before dead-lettering.
@@ -140,3 +146,5 @@ CREATE TABLE outbox (
 -- One outcome event per request, whatever the redelivery.
 CREATE UNIQUE INDEX ux_outbox_one_outcome ON outbox (fulfillment_request_id);
 CREATE INDEX ix_outbox_unpublished ON outbox (seq) WHERE published_at IS NULL;
+-- Supports the claim's oldest-unpublished-per-aggregate check.
+CREATE INDEX ix_outbox_aggregate_unpublished ON outbox (aggregate_id, seq) WHERE published_at IS NULL;

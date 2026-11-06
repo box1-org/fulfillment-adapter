@@ -1,4 +1,4 @@
-package org.box1.fulfillment;
+package org.box1.fulfillment.backend;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 

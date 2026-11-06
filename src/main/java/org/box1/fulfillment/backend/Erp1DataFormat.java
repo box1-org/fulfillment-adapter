@@ -1,4 +1,4 @@
-package org.box1.fulfillment.camel;
+package org.box1.fulfillment.backend;
 
 import java.io.InputStream;
 import java.io.OutputStream;

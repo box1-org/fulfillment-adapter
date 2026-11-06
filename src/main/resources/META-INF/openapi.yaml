@@ -75,6 +75,31 @@ paths:
               schema: {$ref: '#/components/schemas/Fulfillment'}
         '401': {description: No valid token, when the read policy is authenticated}
         '404': {$ref: '#/components/responses/Problem'}
+  /internal/fulfillments/reconcile:
+    post:
+      tags: [fulfillments]
+      operationId: reconcileFulfillments
+      summary: Operator action after an outage; requeue needs-attention requests with one transport reason (audited)
+      security:
+        - bearer: [fulfillment-writer]
+      parameters:
+        - {name: reason, in: query, required: true, schema: {type: string, enum: [NO_ACKNOWLEDGEMENT, UPLOAD_EXHAUSTED, ERR_RESENDS_EXHAUSTED]}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      responses:
+        '202':
+          description: Requests requeued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reason: {type: string}
+                  requeued: {type: integer}
+                  fulfillmentRequestIds: {type: array, items: {type: string}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {description: No valid token}
+        '403': {description: Token lacks the fulfillment-writer role}
+        '503': {$ref: '#/components/responses/Problem'}
   /internal/fulfillments/{fulfillmentRequestId}/reconcile:
     post:
       tags: [fulfillments]
@@ -147,7 +172,7 @@ components:
         failedUploadAttempts: {type: integer}
         lastUploadAt: {type: [string, 'null'], format: date-time}
         lastError: {type: [string, 'null'], description: 'Fixed category, for example HOST_KEY_REJECTED or ERR_TRUNCATED'}
-        needsAttentionReason: {type: [string, 'null'], description: 'NO_ACKNOWLEDGEMENT, UPLOAD_EXHAUSTED, CONFLICTING_REUSE or ERP_REJECTED_FILE:<code>'}
+        needsAttentionReason: {type: [string, 'null'], description: 'NO_ACKNOWLEDGEMENT, UPLOAD_EXHAUSTED, ERR_RESENDS_EXHAUSTED, CONFLICTING_REUSE or ERP_REJECTED_FILE:<code>'}
         erpAcknowledgement: {type: string, enum: [NONE, ACKNOWLEDGED]}
         acknowledgedAt: {type: [string, 'null'], format: date-time}
         outcome: {type: string, enum: [AWAITING_ERP, PENDING, HELD, SHIPPED, REJECTED], description: HELD is an operator hold, not a failure}

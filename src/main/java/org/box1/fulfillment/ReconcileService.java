@@ -59,6 +59,25 @@ public class ReconcileService {
         return acted;
     }
 
+    /** Reasons an operator may retry in bulk: transport problems only, never a protocol or identity conflict. */
+    public static final java.util.Set<String> BULK_REASONS =
+            java.util.Set.of("NO_ACKNOWLEDGEMENT", "UPLOAD_EXHAUSTED", "ERR_RESENDS_EXHAUSTED");
+
+    /** Operator action after an outage: requeue up to {@code limit} requests with one transport reason, each audited. */
+    @Transactional
+    public java.util.List<String> operatorReconcileAll(String reason, int limit, String actor) {
+        if (!BULK_REASONS.contains(reason)) {
+            throw new IllegalArgumentException("reason not eligible for bulk reconcile");
+        }
+        java.util.List<String> ids = store.operatorRequeueByReason(reason, limit);
+        for (String id : ids) {
+            store.audit(id, "RECONCILE_REQUEUED", actor, "bulk " + reason);
+            metrics.resend("OPERATOR");
+        }
+        LOG.infov("Operator bulk reconcile: reason={0} requeued={1}", reason, ids.size());
+        return ids;
+    }
+
     /** Operator action: move a needs-attention request back to dispatch with a fresh budget. */
     @Transactional
     public boolean operatorReconcile(String id, String actor) {

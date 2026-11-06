@@ -82,7 +82,7 @@ public class RestHandlers {
                     e.getMessage().setHeader("Location", location);
                 }
                 case EQUIVALENT -> {
-                    respond(e, 200, json(store.view(command.fulfillmentRequestId()).orElseThrow()), "application/json");
+                    respond(e, 200, json(view(command.fulfillmentRequestId())), "application/json");
                     e.getMessage().setHeader("Location", location);
                 }
                 case CONFLICT -> problem(e, 409, "Conflicting reuse of fulfillmentRequestId",
@@ -129,16 +129,62 @@ public class RestHandlers {
     /** POST /internal/fulfillments/{id}/reconcile: needs-attention back to dispatch, audited. */
     public void reconcile(Exchange e) {
         String id = e.getMessage().getHeader("fulfillmentRequestId", String.class);
-        if (id == null || !ID.matcher(id).matches() || store.view(id).isEmpty()) {
-            problem(e, 404, "Not found", "No fulfillment request with this ID");
+        try {
+            if (id == null || !ID.matcher(id).matches() || store.view(id).isEmpty()) {
+                problem(e, 404, "Not found", "No fulfillment request with this ID");
+                return;
+            }
+            boolean requeued = reconcile.operatorReconcile(id, actor(e));
+            if (!requeued) {
+                problem(e, 409, "Not in needs-attention", "Only a request in NEEDS_ATTENTION can be reconciled");
+                return;
+            }
+            respond(e, 202, json(view(id)), "application/json");
+        } catch (StoreException failure) {
+            problem(e, 503, "Storage unavailable", "Retry later");
+        }
+    }
+
+    /** POST /internal/fulfillments/reconcile?reason=...&limit=...: bulk requeue after an outage, each request audited. */
+    public void reconcileAll(Exchange e) {
+        String reason = e.getMessage().getHeader("reason", String.class);
+        String limitText = e.getMessage().getHeader("limit", String.class);
+        if (reason == null || !ReconcileService.BULK_REASONS.contains(reason)) {
+            problem(e, 400, "Invalid reason", "reason must be one of " + new java.util.TreeSet<>(ReconcileService.BULK_REASONS));
             return;
         }
-        boolean requeued = reconcile.operatorReconcile(id, actor(e));
-        if (!requeued) {
-            problem(e, 409, "Not in needs-attention", "Only a request in NEEDS_ATTENTION can be reconciled");
+        int limit;
+        try {
+            limit = limitText == null ? 100 : Integer.parseInt(limitText);
+        } catch (NumberFormatException failure) {
+            limit = -1;
+        }
+        if (limit < 1 || limit > 1000) {
+            problem(e, 400, "Invalid limit", "limit must be 1 to 1000");
             return;
         }
-        respond(e, 202, json(store.view(id).orElseThrow()), "application/json");
+        try {
+            java.util.List<String> ids = reconcile.operatorReconcileAll(reason, limit, actor(e));
+            ObjectNode body = mapper.createObjectNode();
+            body.put("reason", reason);
+            body.put("requeued", ids.size());
+            body.set("fulfillmentRequestIds", mapper.valueToTree(ids));
+            respond(e, 202, body.toString(), "application/json");
+        } catch (StoreException failure) {
+            problem(e, 503, "Storage unavailable", "Retry later");
+        }
+    }
+
+    /** Last resort for anything not handled above: a fixed problem document, no stack trace, no echoed headers. */
+    public void unexpected(Exchange e) {
+        Throwable cause = e.getProperty(Exchange.EXCEPTION_CAUGHT, Throwable.class);
+        LOG.warnv("Unhandled REST failure: {0}", cause == null ? "unknown" : cause.getClass().getSimpleName());
+        boolean storage = cause instanceof StoreException || cause != null && cause.getCause() instanceof StoreException;
+        problem(e, storage ? 503 : 500, storage ? "Storage unavailable" : "Internal error", "Retry later");
+    }
+
+    private FulfillmentView view(String id) {
+        return store.view(id).orElseThrow(() -> new IllegalStateException("accepted request not readable"));
     }
 
     private FulfillmentCommand parse(String body, Exchange e) {

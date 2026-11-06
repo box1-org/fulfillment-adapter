@@ -1,4 +1,6 @@
-package org.box1.fulfillment;
+package org.box1.fulfillment.backend;
+
+import org.box1.fulfillment.FulfillmentMetrics;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -6,7 +8,6 @@ import java.util.List;
 import java.util.UUID;
 
 import jakarta.enterprise.context.ApplicationScoped;
-import org.box1.fulfillment.backend.LegacyErp1Backend;
 import org.box1.fulfillment.erp1.Erp1Request;
 import org.box1.fulfillment.store.FulfillmentStore;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
@@ -18,12 +19,14 @@ import org.jboss.logging.MDC;
  * The upload row is written before the transfer starts, so every nonce used is on record.
  */
 @ApplicationScoped
-public class DispatchService {
-    private static final Logger LOG = Logger.getLogger(DispatchService.class);
+public class LegacyDispatchService {
+    private static final Logger LOG = Logger.getLogger(LegacyDispatchService.class);
 
     private final FulfillmentStore store;
     private final FulfillmentMetrics metrics;
     private final String owner = "dispatch-" + UUID.randomUUID();
+    /** Set when a connection-level failure happens inside the current batch; the dispatch route is single-threaded. */
+    private volatile boolean endpointDown;
     private final int batchSize;
     private final int leaseSeconds;
     private final long uploadBackoffBase;
@@ -33,7 +36,7 @@ public class DispatchService {
     private final long ackTimeoutMax;
     private final long probeSeconds;
 
-    public DispatchService(FulfillmentStore store, FulfillmentMetrics metrics,
+    public LegacyDispatchService(FulfillmentStore store, FulfillmentMetrics metrics,
             @ConfigProperty(name = "fulfillment.dispatch.batch-size") int batchSize,
             @ConfigProperty(name = "fulfillment.dispatch.lease-seconds") int leaseSeconds,
             @ConfigProperty(name = "fulfillment.upload.backoff-base-seconds") long uploadBackoffBase,
@@ -57,7 +60,8 @@ public class DispatchService {
     /** Claim due requests and record one new upload (fresh nonce) for each. */
     public List<UploadJob> claim() {
         List<UploadJob> jobs = new ArrayList<>();
-        for (FulfillmentStore.Due due : store.claimDueUploads(owner, batchSize, leaseSeconds)) {
+        endpointDown = false;
+        for (FulfillmentStore.Due due : store.claimDueUploads(LegacyErp1Backend.ID, owner, batchSize, leaseSeconds)) {
             String nonce = LegacyErp1Backend.newNonce();
             String fileName = LegacyErp1Backend.requestFileName(due.fulfillmentRequestId(), nonce);
             String reason = due.reason() == null ? "FIRST" : due.reason();
@@ -74,9 +78,27 @@ public class DispatchService {
         withMdc(job, () -> LOG.infov("Uploaded request file: reason={0}", job.reason()));
     }
 
+    /**
+     * After a connection-level failure the rest of the batch is given back without spending attempts, so an outage
+     * costs each request one attempt per batch at most and a batch never outlives its lease.
+     */
+    public boolean skipIfEndpointDown(UploadJob job) {
+        if (!endpointDown) {
+            return false;
+        }
+        store.releaseUnattempted(job.due().fulfillmentRequestId(), job.fileName(), owner, uploadBackoffBase);
+        return true;
+    }
+
+    /** End of a dispatch batch. */
+    public void batchDone() {
+        endpointDown = false;
+    }
+
     /** Transport failure: retry with backoff, bounded. Never a business outcome. */
     public void failed(UploadJob job, Throwable error) {
         String type = TransportErrors.classify(error);
+        endpointDown = endpointDown || TransportErrors.isEndpointLevel(type);
         long backoff = Math.min(uploadBackoffBase * (1L << Math.min(job.due().failedUploadAttempts(), 20)), uploadBackoffMax);
         boolean exhausted = store.uploadFailed(job.due().fulfillmentRequestId(), job.fileName(), owner, type, backoff,
                 uploadMaxAttempts);

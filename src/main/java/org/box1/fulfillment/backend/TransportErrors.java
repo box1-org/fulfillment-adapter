@@ -1,4 +1,4 @@
-package org.box1.fulfillment;
+package org.box1.fulfillment.backend;
 
 import java.net.ConnectException;
 import java.net.SocketTimeoutException;
@@ -39,5 +39,13 @@ public final class TransportErrors {
             }
         }
         return "IO_" + error.getClass().getSimpleName();
+    }
+
+    /** A failure that will affect every upload to the same endpoint, not just this file. */
+    public static boolean isEndpointLevel(String category) {
+        return switch (category) {
+            case "HOST_KEY_REJECTED", "AUTH_FAILED", "CONNECTION_REFUSED", "CONNECTION_CLOSED", "TIMEOUT", "UNKNOWN_HOST" -> true;
+            default -> false;
+        };
     }
 }
