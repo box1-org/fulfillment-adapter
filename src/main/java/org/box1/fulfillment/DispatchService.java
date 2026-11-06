@@ -76,7 +76,7 @@ public class DispatchService {
 
     /** Transport failure: retry with backoff, bounded. Never a business outcome. */
     public void failed(UploadJob job, Throwable error) {
-        String type = error.getClass().getSimpleName();
+        String type = TransportErrors.classify(error);
         long backoff = Math.min(uploadBackoffBase * (1L << Math.min(job.due().failedUploadAttempts(), 20)), uploadBackoffMax);
         boolean exhausted = store.uploadFailed(job.due().fulfillmentRequestId(), job.fileName(), owner, type, backoff,
                 uploadMaxAttempts);

@@ -1,0 +1,77 @@
+# Runbook
+
+## Health
+
+- `/q/health/ready` depends on PostgreSQL only. Kafka and the ERP are deliberately not readiness dependencies: an ERP
+  outage must not stop acceptance.
+- `/q/health/live` is the Golden Path liveness check.
+
+## Metrics
+
+| Metric | Meaning | Watch for |
+|---|---|---|
+| `fulfillment_backlog` | accepted, not yet acknowledged by the ERP | growth while the ERP is up |
+| `fulfillment_oldest_unacknowledged_seconds` | age of the oldest such request | above the acknowledgement timeout |
+| `fulfillment_oldest_unacknowledged_upload_seconds` | age of the oldest unacknowledged upload | |
+| `fulfillment_queued` | uploads due now | stays high: SFTP down or credentials wrong |
+| `fulfillment_needs_attention` | automatic work stopped | any non-zero |
+| `fulfillment_awaiting_operator`, `fulfillment_held` | ERP `PENDING`/`HELD`; expected in MANUAL mode | |
+| `fulfillment_resends_total{reason}` | `NO_ACK`, `PROBE`, `ERR_RESEND`, `OPERATOR` | `NO_ACK` rising |
+| `fulfillment_uploads_total{result,reason}` | uploads and failures | `failed` rising |
+| `fulfillment_erp_errors_total{code}` | `ERR` files by code | any |
+| `fulfillment_quarantined_total{reason}`, `fulfillment_quarantined_files` | results not applied | any |
+| `fulfillment_results_total{outcome}` | `APPLY`, `LATE`, `DUPLICATE`, `QUARANTINE` | |
+| `fulfillment_outbox_pending`, `fulfillment_outbox_oldest_seconds` | events not yet confirmed by Kafka | growth |
+| `fulfillment_events_consumed_total{outcome}` | Kafka input outcomes, including `dead_lettered` | |
+
+## Needs-attention
+
+`GET /api/fulfillments/{id}` shows `needsAttentionReason`:
+
+| Reason | Meaning | Action |
+|---|---|---|
+| `NO_ACKNOWLEDGEMENT` | uploads succeeded but the ERP never answered | check the ERP worker and `inbound/`; then reconcile |
+| `UPLOAD_EXHAUSTED` | SFTP failed up to the bound; `lastError` names the cause | fix connectivity, key or host key; then reconcile |
+| `ERP_REJECTED_FILE:<code>` | the ERP rejected a file the adapter wrote | adapter defect or protocol disagreement: do not reconcile until understood |
+| `CONFLICTING_REUSE` | the ERP holds a different request under this ID | resolve in the ERP with its owner; never resend |
+
+Reconcile (audited, role `fulfillment-writer`):
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" https://<route>/internal/fulfillments/<id>/reconcile
+```
+
+A valid ERP result arriving later always applies and clears needs-attention, except `CONFLICTING_REUSE`.
+
+`lastError` categories: `HOST_KEY_REJECTED`, `AUTH_FAILED`, `CONNECTION_REFUSED`, `CONNECTION_CLOSED`, `TIMEOUT`,
+`UNKNOWN_HOST`, `IO_<type>`, `ERR_<code>`.
+
+## Host-key rotation
+
+The adapter trusts only the keys in `known_hosts` from its SFTP Secret. To rotate: add the new key next to the old one
+in the Secret, restart the adapter, let the VM switch keys, then remove the old key. A key mismatch shows as
+`lastError=HOST_KEY_REJECTED`; nothing is uploaded and accepted work stays queued.
+
+## Dead letters and replay
+
+Records that can never be accepted (invalid JSON or envelope, values ERP1 cannot carry, conflicting reuse) are
+recorded in `rejected_command` with topic, partition and offset, then sent unchanged to `box1.fulfillment.dlq.v1`.
+Replay is manual: fix the cause, then produce the original value to `box1.order.events.v1`. Acceptance deduplicates
+by `fulfillmentRequestId`, so replaying an already accepted request has no effect. A database outage holds the channel
+and never dead-letters a valid event.
+
+## Restart and outages
+
+Accepted work, uploads, results and outbox rows are in PostgreSQL. After any restart, due uploads resume, expired
+leases are reclaimed, and unacknowledged requests are resent under new nonces. An upload interrupted before its
+rename leaves at most a `.tmp` name, which the ERP never reads.
+
+## Files
+
+The adapter deletes its own `consumed/` files after `FULFILLMENT_CONSUMED_RETENTION` (7 days). Every result and
+quarantined file's bytes are also kept in `erp_result` and `erp_file_receipt`.
+
+## Rollback
+
+Roll forward with a new digest; reverting the promotion restores the previous image. The V1 schema is new, so there
+is no earlier schema to return to. This procedure has not been exercised.
