@@ -1,15 +1,58 @@
 # fulfillment-adapter
 
-Protect the legacy ERP from unreliable upstream and unreliable transport.
+The modern integration boundary in front of the legacy ERP appliance ([box1-docs#13](https://github.com/box1-org/box1-docs/issues/13)).
+It durably accepts fulfillment requests, translates them into ERP1 legacy files, exchanges them with the ERP over SFTP,
+reconciles the ERP's results and publishes `shipment.confirmed.v1` and `shipment.failed.v1`. Apache Camel routes run
+inside this Quarkus application; there is no Camel K, no extra broker, and no HTTP call to the ERP.
 
-Owner: `user:default/mike4263`. Quarkus 3.40.1.1, Java 21, Maven 3.9.16.
+Owner: `user:default/mike4263`. Quarkus 3.40.1.1, Camel Quarkus 3.40.0 (Camel 4.22.1), Java 21.
 
-Optional integrations selected at creation: PostgreSQL = `false`, Kafka = `true`.
-The integrations add their Quarkus extensions and GitOps resources. PostgreSQL creates a
-service-owned Deployment, Service, PVC, and Secret placeholder; replace its password before
-syncing. Kafka uses the separately managed shared `box1-kafka` Strimzi cluster; service
-onboarding does not create a `KafkaTopic`. The broker address is
-`box1-kafka-kafka-bootstrap.box1-kafka.svc:9092`.
+| Concern | Where |
+|---|---|
+| Inputs | Kafka `fulfillment.requested.v1` on `box1.order.events.v1` (group `fulfillment`, production) and `POST /api/fulfillments` (demos, operators); one acceptance path |
+| Legacy protocol | ERP1, [`box1-ops-contracts/legacy/erp-file/v1/SPEC.md`](https://github.com/box1-org/box1-ops-contracts/blob/eef13ead19aa2ed4b6bae071f26e14dd1676f8f1/legacy/erp-file/v1/SPEC.md), pinned in `pom.xml` (`contracts.ref`) and never copied |
+| Outputs | `box1.fulfillment.events.v1`, keyed by `orderId`, via a transactional outbox |
+| Dead letters | `box1.fulfillment.dlq.v1` (must exist before Kafka input is enabled) |
+| State | the service's own PostgreSQL (Flyway `V1__fulfillment_schema.sql`) |
+| API | `src/main/resources/META-INF/openapi.yaml`, served at `/q/openapi` |
+| Design | [docs/architecture.md](docs/architecture.md) |
+| Operations | [docs/runbook.md](docs/runbook.md) |
+
+## Configuration
+
+All settings are environment variables; none has a real credential as a default.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `QUARKUS_DATASOURCE_JDBC_URL`, `_USERNAME`, `_PASSWORD` | none | PostgreSQL; password from a Secret reference |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka |
+| `FULFILLMENT_KAFKA_INPUT_ENABLED` | `true` | consume `fulfillment.requested.v1` |
+| `FULFILLMENT_SFTP_ENABLED` | `false` | dispatch and result routes; accepted work stays queued while off |
+| `FULFILLMENT_SFTP_HOST`, `_PORT`, `_USERNAME` | `localhost`, `22`, `erpsftp` | ERP exchange |
+| `FULFILLMENT_SFTP_PRIVATE_KEY_FILE`, `_KNOWN_HOSTS_FILE` | `/var/run/secrets/box1/sftp/...` | mounted from a Secret; strict host-key checking is always on |
+| `FULFILLMENT_READ_POLICY` | `authenticated` | `GET` access: `authenticated` or `permit` |
+| `FULFILLMENT_JWT_ISSUER`, `FULFILLMENT_JWKS_URL` | Keycloak realm `box1` | token verification; audience `fulfillment-adapter`, role `fulfillment-writer` |
+| `FULFILLMENT_ACK_TIMEOUT_BASE_SECONDS`, `_MAX_SECONDS`, `FULFILLMENT_ACK_MAX_UPLOADS` | 120, 3600, 8 | resend schedule without acknowledgement |
+| `FULFILLMENT_UPLOAD_BACKOFF_BASE_SECONDS`, `_MAX_SECONDS`, `FULFILLMENT_UPLOAD_MAX_ATTEMPTS` | 10, 300, 40 | upload retry bound |
+| `FULFILLMENT_ERR_MAX_RESENDS` | 5 | resends after transport-damage `ERR` files, with backoff |
+| `FULFILLMENT_PROBE_INTERVAL_SECONDS` | 21600 | equivalent-resend probe for acknowledged, unfinished requests |
+| `FULFILLMENT_CONSUMED_RETENTION` | `P7D` | deletion of the adapter's `consumed/` files |
+
+## Tests
+
+```sh
+./mvnw verify -DskipITs=false                 # what CI runs: unit, fixture and HTTP tests, Checkstyle, SpotBugs
+export DOCKER_HOST=unix://$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}') TESTCONTAINERS_RYUK_DISABLED=true
+./mvnw verify -DskipITs=false -Pcontainers    # adds PostgreSQL and Kafka scenarios (containers named run13-tc-*)
+```
+
+ERP1 fixture tests fetch `box1-ops-contracts` at `contracts.ref` over HTTPS; set `-Dcontracts.dir=<checkout>` to
+read a local checkout at that commit instead. SFTP and ERP scenarios run against the ERP container harness from
+[box1-ops-erp-simulator](https://github.com/box1-org/box1-ops-erp-simulator); the scripts are in the
+box1-docs run state for #13 (`agent-runs/13-fulfillment-adapter/evidence/scripts/`).
+
+The Golden Path greeting endpoint and `box1_greetings_total` metric remain because the shared release smoke test
+asserts them.
 
 ## Local development
 

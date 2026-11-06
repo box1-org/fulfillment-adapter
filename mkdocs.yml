@@ -2,5 +2,7 @@ site_name: fulfillment-adapter
 site_description: "Protect the legacy ERP from unreliable upstream and unreliable transport."
 nav:
   - Home: index.md
+  - Architecture: architecture.md
+  - Runbook: runbook.md
 plugins:
   - techdocs-core

@@ -1,0 +1,190 @@
+openapi: 3.1.0
+info:
+  title: fulfillment-adapter REST API
+  version: 1.0.0
+  description: >-
+    Durable acceptance of fulfillment requests for the legacy ERP. Kafka `fulfillment.requested.v1` is the production
+    input; this API serves demos and operators, and both use one acceptance path. A 202 means the request and its
+    dispatch intent are committed; it does not mean uploaded, acknowledged or shipped. Paths follow box1-docs#13
+    (`/api/fulfillments`) rather than the `/api/v1/` convention (run decision D-001).
+tags:
+  - name: fulfillments
+paths:
+  /api/fulfillments:
+    post:
+      tags: [fulfillments]
+      operationId: acceptFulfillment
+      summary: Accept a fulfillment request (requires role fulfillment-writer)
+      security:
+        - bearer: [fulfillment-writer]
+      parameters:
+        - name: X-Correlation-ID
+          in: header
+          required: false
+          schema: {type: string, maxLength: 128}
+        - name: traceparent
+          in: header
+          required: false
+          schema: {type: string, pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FulfillmentRequest'}
+            example:
+              fulfillmentRequestId: ful_1042
+              orderId: ord_1042
+              reservationId: res_1042
+              siteId: site_nyc
+              sku: SKU-42
+              quantity: 2
+      responses:
+        '202':
+          description: Accepted and committed for dispatch.
+          headers:
+            Location: {schema: {type: string}, description: Status resource}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Accepted'}
+        '200':
+          description: An equivalent request (ERP1 section 6) already exists; nothing changed.
+          headers:
+            Location: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Fulfillment'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {description: No valid token}
+        '403': {description: Token lacks the fulfillment-writer role}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /api/fulfillments/{fulfillmentRequestId}:
+    get:
+      tags: [fulfillments]
+      operationId: getFulfillment
+      summary: Status with acceptance, dispatch, ERP acknowledgement and outcome reported separately
+      security:
+        - bearer: []
+      parameters:
+        - {name: fulfillmentRequestId, in: path, required: true, schema: {type: string, pattern: '^ful_[A-Za-z0-9_-]{1,124}$'}}
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Fulfillment'}
+        '401': {description: No valid token, when the read policy is authenticated}
+        '404': {$ref: '#/components/responses/Problem'}
+  /internal/fulfillments/reconcile:
+    post:
+      tags: [fulfillments]
+      operationId: reconcileFulfillments
+      summary: Operator action after an outage; requeue needs-attention requests with one transport reason (audited)
+      security:
+        - bearer: [fulfillment-writer]
+      parameters:
+        - {name: reason, in: query, required: true, schema: {type: string, enum: [NO_ACKNOWLEDGEMENT, UPLOAD_EXHAUSTED, ERR_RESENDS_EXHAUSTED]}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      responses:
+        '202':
+          description: Requests requeued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reason: {type: string}
+                  requeued: {type: integer}
+                  fulfillmentRequestIds: {type: array, items: {type: string}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {description: No valid token}
+        '403': {description: Token lacks the fulfillment-writer role}
+        '503': {$ref: '#/components/responses/Problem'}
+  /internal/fulfillments/{fulfillmentRequestId}/reconcile:
+    post:
+      tags: [fulfillments]
+      operationId: reconcileFulfillment
+      summary: Operator action; move a NEEDS_ATTENTION request back to dispatch with a fresh retry budget (audited)
+      security:
+        - bearer: [fulfillment-writer]
+      parameters:
+        - {name: fulfillmentRequestId, in: path, required: true, schema: {type: string}}
+      responses:
+        '202':
+          description: Requeued for an equivalent resend.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Fulfillment'}
+        '401': {description: No valid token}
+        '403': {description: Token lacks the fulfillment-writer role}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Keycloak realm box1, audience fulfillment-adapter, client role in resource_access.fulfillment-adapter.roles.
+  responses:
+    Problem:
+      description: RFC 9457 problem document; names fields, never values.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    FulfillmentRequest:
+      type: object
+      additionalProperties: false
+      description: Exactly the fulfillment.requested.v1 payload, limited to what ERP1 can carry. Values are rejected, never truncated.
+      required: [fulfillmentRequestId, orderId, reservationId, siteId, sku, quantity]
+      properties:
+        fulfillmentRequestId: {type: string, pattern: '^ful_[A-Za-z0-9_-]{1,124}$'}
+        orderId: {type: string, pattern: '^ord_[A-Za-z0-9_-]{1,124}$'}
+        reservationId: {type: string, pattern: '^res_[A-Za-z0-9_-]{1,124}$'}
+        siteId: {type: string, pattern: '^site_[A-Za-z0-9_-]{1,123}$'}
+        sku: {type: string, minLength: 1, maxLength: 80, description: No control characters; length in code points}
+        quantity: {type: integer, minimum: 1, maximum: 999999999}
+    Accepted:
+      type: object
+      required: [fulfillmentRequestId, acceptance, status]
+      properties:
+        fulfillmentRequestId: {type: string}
+        acceptance: {type: string, enum: [ACCEPTED]}
+        status: {type: string, description: Status resource path}
+    Fulfillment:
+      type: object
+      required: [fulfillmentRequestId, orderId, acceptance, dispatch, erpAcknowledgement, outcome]
+      properties:
+        fulfillmentRequestId: {type: string}
+        orderId: {type: string}
+        reservationId: {type: string}
+        siteId: {type: string}
+        sku: {type: string}
+        quantity: {type: integer}
+        origin: {type: string, enum: [EVENT, API]}
+        backend: {type: string, enum: [legacy-erp1]}
+        acceptance: {type: string, enum: [ACCEPTED]}
+        acceptedAt: {type: string, format: date-time}
+        dispatch: {type: string, enum: [QUEUED, UPLOADED, NEEDS_ATTENTION]}
+        uploads: {type: integer}
+        resends: {type: integer}
+        failedUploadAttempts: {type: integer}
+        lastUploadAt: {type: [string, 'null'], format: date-time}
+        lastError: {type: [string, 'null'], description: 'Fixed category, for example HOST_KEY_REJECTED or ERR_TRUNCATED'}
+        needsAttentionReason: {type: [string, 'null'], description: 'NO_ACKNOWLEDGEMENT, UPLOAD_EXHAUSTED, ERR_RESENDS_EXHAUSTED, CONFLICTING_REUSE or ERP_REJECTED_FILE:<code>'}
+        erpAcknowledgement: {type: string, enum: [NONE, ACKNOWLEDGED]}
+        acknowledgedAt: {type: [string, 'null'], format: date-time}
+        outcome: {type: string, enum: [AWAITING_ERP, PENDING, HELD, SHIPPED, REJECTED], description: HELD is an operator hold, not a failure}
+        revision: {type: integer, description: Highest applied ERP revision}
+        shipmentId: {type: [string, 'null']}
+        statusAt: {type: [string, 'null'], format: date-time}
+        reasonCode: {type: [string, 'null'], description: ERP rejection code; operator reason text is never exposed}
+        updatedAt: {type: string, format: date-time}
+    Problem:
+      type: object
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
