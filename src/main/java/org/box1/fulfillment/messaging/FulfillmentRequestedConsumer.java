@@ -60,7 +60,7 @@ public class FulfillmentRequestedConsumer {
         try {
             parsed = parser.parse(text(record));
         } catch (PoisonEventException e) {
-            reject(record, null, null, e.reason());
+            reject(record, e.eventId(), e.fulfillmentRequestId(), e.reason());
             throw e;
         }
         if (parsed.isEmpty()) {

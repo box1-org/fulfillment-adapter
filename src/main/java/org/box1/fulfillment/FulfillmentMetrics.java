@@ -71,7 +71,7 @@ public class FulfillmentMetrics {
 
     public void needsAttention(String reason) {
         String label = reason.startsWith("ERP_REJECTED_FILE") ? "ERP_REJECTED_FILE" : reason;
-        count("fulfillment_needs_attention_total", "reason", label);
+        count("fulfillment_needs_attention_entries_total", "reason", label);
     }
 
     public void result(String outcome) {

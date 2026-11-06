@@ -75,12 +75,18 @@ public class EventParser {
         try {
             CommandValidator.validate(command);
         } catch (InvalidCommandException e) {
-            throw new PoisonEventException(e.reason(), e.getMessage());
+            throw new PoisonEventException(e.reason(), e.getMessage(), eventId, readableId(command.fulfillmentRequestId()));
         }
         if (!command.orderId().equals(aggregateId)) {
-            throw new PoisonEventException("AGGREGATE_MISMATCH", "aggregateId does not match orderId");
+            throw new PoisonEventException("AGGREGATE_MISMATCH", "aggregateId does not match orderId", eventId,
+                    command.fulfillmentRequestId());
         }
         return Optional.of(command);
+    }
+
+    /** Only a well-formed request ID is stored in the rejection record. */
+    private static String readableId(String id) {
+        return id != null && id.matches("^ful_[A-Za-z0-9_-]{1,124}$") ? id : null;
     }
 
     private JsonNode read(String value) {
