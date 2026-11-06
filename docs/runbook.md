@@ -1,5 +1,21 @@
 # Runbook
 
+## Operator access
+
+Writes and operator actions need a box1-realm token with the `fulfillment-adapter` client role `fulfillment-writer`
+(granted in the Keycloak admin console). `scripts/operator-login.py` logs you in through the browser
+(Authorization Code + PKCE, loopback redirect) and makes one call; the token stays in memory and is never printed:
+
+```sh
+scripts/operator-login.py create request.json        # body: fulfillmentRequestId, orderId, reservationId, siteId, sku, quantity
+scripts/operator-login.py status ful_1042            # no login while the read policy is permit
+scripts/operator-login.py reconcile ful_1042
+scripts/operator-login.py reconcile-all UPLOAD_EXHAUSTED --limit 500
+```
+
+`--api` and `--realm` select another environment. A 403 means the token lacks the role; a 401 means no token, an
+expired token or a wrong audience.
+
 ## Health
 
 - `/q/health/ready` depends on PostgreSQL only. Kafka and the ERP are deliberately not readiness dependencies: an ERP
@@ -39,16 +55,12 @@
 | `ERP_REJECTED_FILE:<code>` | the ERP rejected a file the adapter wrote | adapter defect or protocol disagreement: do not reconcile until understood |
 | `CONFLICTING_REUSE` | the ERP holds a different request under this ID | resolve in the ERP with its owner; never resend |
 
-Reconcile (audited, role `fulfillment-writer`):
-
-```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" https://<route>/internal/fulfillments/<id>/reconcile
-```
+Reconcile (audited, role `fulfillment-writer`): `scripts/operator-login.py reconcile <id>`.
 
 After an outage, requeue every request with one transport reason at once (each is audited; at most `limit`, 1–1000):
 
 ```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" "https://<route>/internal/fulfillments/reconcile?reason=UPLOAD_EXHAUSTED&limit=500"
+scripts/operator-login.py reconcile-all UPLOAD_EXHAUSTED --limit 500
 ```
 
 Bulk reconcile accepts only `NO_ACKNOWLEDGEMENT`, `UPLOAD_EXHAUSTED` and `ERR_RESENDS_EXHAUSTED`. During an outage, only the
