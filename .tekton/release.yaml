@@ -135,13 +135,6 @@ spec:
         value: "fulfillment-adapter"
       - name: application-namespace
         value: "fulfillment-adapter-dev"
-    results:
-    - name: image-digest
-      value: "$(tasks.build.results.image-digest)"
-    - name: gitops-pr
-      value: "$(tasks.promote.results.pr-url)"
-    - name: gitops-revision
-      value: "$(tasks.promote.results.gitops-revision)"
     # The shared smoke task knows nothing about the adapter. These checks write nothing.
     - name: fulfillment-api-smoke
       runAfter:
@@ -178,6 +171,13 @@ spec:
             status, spec = call('/q/openapi')
             assert status == 200 and '/api/fulfillments' in spec, status
             print('fulfillment API smoke passed')
+    results:
+    - name: image-digest
+      value: "$(tasks.build.results.image-digest)"
+    - name: gitops-pr
+      value: "$(tasks.promote.results.pr-url)"
+    - name: gitops-revision
+      value: "$(tasks.promote.results.gitops-revision)"
   taskRunSpecs:
   - pipelineTaskName: promote
     serviceAccountName: ci-gitops
