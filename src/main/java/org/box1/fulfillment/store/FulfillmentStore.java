@@ -488,9 +488,13 @@ public class FulfillmentStore {
                 + " count(*) FILTER (WHERE dispatch_state = 'NEEDS_ATTENTION'),"
                 + " count(*) FILTER (WHERE erp_status IN ('PENDING', 'HELD')),"
                 + " count(*) FILTER (WHERE erp_status = 'HELD'),"
-                + " COALESCE(EXTRACT(EPOCH FROM now() - min(accepted_at) FILTER (WHERE acknowledged_at IS NULL)), 0),"
+                // Ages exclude NEEDS_ATTENTION, like the backlog count: a request whose automatic work stopped is
+                // reported by needs_attention, and must not hold the ERP-delay gauges (and alert) high forever.
+                + " COALESCE(EXTRACT(EPOCH FROM now() - min(accepted_at)"
+                + "   FILTER (WHERE acknowledged_at IS NULL AND dispatch_state <> 'NEEDS_ATTENTION')), 0),"
                 + " COALESCE(EXTRACT(EPOCH FROM now() - min(last_upload_at)"
-                + "   FILTER (WHERE acknowledged_at IS NULL AND last_upload_at IS NOT NULL)), 0),"
+                + "   FILTER (WHERE acknowledged_at IS NULL AND last_upload_at IS NOT NULL"
+                + "   AND dispatch_state <> 'NEEDS_ATTENTION')), 0),"
                 + " (SELECT count(*) FROM erp_file_receipt WHERE outcome = 'QUARANTINE'),"
                 + " (SELECT count(*) FROM outbox WHERE published_at IS NULL),"
                 + " COALESCE((SELECT EXTRACT(EPOCH FROM now() - min(created_at)) FROM outbox WHERE published_at IS NULL), 0)"

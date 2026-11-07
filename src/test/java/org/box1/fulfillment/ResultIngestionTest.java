@@ -39,6 +39,9 @@ class ResultIngestionTest {
     @Inject
     LegacyResultService results;
 
+    @Inject
+    org.box1.fulfillment.store.FulfillmentStore store;
+
     @BeforeEach
     void clean() {
         for (String id : List.of("ful_1042", "ful_2001", "ful_9999")) {
@@ -140,6 +143,11 @@ class ResultIngestionTest {
     @Test
     void errFilesAreActedOnByCodeAndRecordedOnce() throws Exception {
         sent("ful_1042", "ord_1042");
+        // box1-docs#22: backdate this request so its age dominates the ERP-delay gauges while it is merely unacknowledged.
+        Db.exec("UPDATE fulfillment_request SET accepted_at = now() - interval '1 day', last_upload_at = now() - interval '1 day'"
+                + " WHERE fulfillment_request_id = 'ful_1042'");
+        assertTrue(store.gauges().oldestUnacknowledgedSeconds() >= 86_000, "unacknowledged request ages the gauge");
+        assertTrue(store.gauges().oldestUnacknowledgedUploadSeconds() >= 86_000, "unacknowledged upload ages the gauge");
         Db.exec("INSERT INTO upload (file_name, nonce, fulfillment_request_id, state, reason)"
                 + " VALUES ('REQ.ful_1042.0a1b2c3d.erp1', '0a1b2c3d', 'ful_1042', 'UPLOADED', 'FIRST')");
         // Transport damage: equivalent resend, counted against the upload budget.
@@ -153,6 +161,10 @@ class ResultIngestionTest {
         assertEquals("NEEDS_ATTENTION", Db.one("SELECT dispatch_state FROM fulfillment_request WHERE fulfillment_request_id = 'ful_1042'"));
         assertEquals("ERP_REJECTED_FILE:FIELD_VALUE",
                 Db.one("SELECT needs_attention_reason FROM fulfillment_request WHERE fulfillment_request_id = 'ful_1042'"));
+        // A NEEDS_ATTENTION request is reported by needs_attention, not as an ERP delay (box1-docs#22).
+        assertTrue(store.gauges().needsAttention() >= 1);
+        assertTrue(store.gauges().oldestUnacknowledgedSeconds() < 86_000, "needs-attention request leaves the ERP-delay age");
+        assertTrue(store.gauges().oldestUnacknowledgedUploadSeconds() < 86_000, "needs-attention request leaves the upload age");
         assertNull(Db.one("SELECT erp_status FROM fulfillment_request WHERE fulfillment_request_id = 'ful_1042'"));
         assertEquals(0L, Db.one("SELECT count(*) FROM outbox WHERE fulfillment_request_id = 'ful_1042'"));
         // A valid late acknowledgement still applies and clears needs-attention.
