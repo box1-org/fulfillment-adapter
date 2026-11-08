@@ -1,0 +1,85 @@
+# REST boundary. Authentication and roles are enforced before these routes run (HTTP permissions in
+# application.properties); restHandlers parses strictly, calls direct:accept-command and maps outcomes to HTTP.
+- restConfiguration:
+    component: platform-http
+    bindingMode: "off"
+
+- rest:
+    path: /api/fulfillments
+    post:
+      - id: fulfillment-rest-post
+        consumes: application/json
+        produces: application/json
+        to: direct:rest-post
+    get:
+      - id: fulfillment-rest-get
+        path: "/{fulfillmentRequestId}"
+        produces: application/json
+        to: direct:rest-get
+
+- rest:
+    path: /internal/fulfillments
+    post:
+      - id: fulfillment-rest-reconcile-bulk
+        path: /reconcile
+        produces: application/json
+        to: direct:rest-reconcile-bulk
+      - id: fulfillment-rest-reconcile
+        path: "/{fulfillmentRequestId}/reconcile"
+        produces: application/json
+        to: direct:rest-reconcile
+
+# REST routes only: an unexpected failure never returns a stack trace or echoes request headers. Only routes that
+# name this configuration get it; on the file routes a handled exception would move an uncommitted file.
+- routeConfiguration:
+    id: rest-errors
+    onException:
+      - onException:
+          exception:
+            - java.lang.Exception
+          handled:
+            constant: "true"
+          steps:
+            - bean:
+                ref: restHandlers
+                method: unexpected
+
+- route:
+    id: fulfillment-rest
+    routeConfigurationId: rest-errors
+    from:
+      uri: direct:rest-post
+      steps:
+        - bean:
+            ref: restHandlers
+            method: post
+
+- route:
+    id: fulfillment-rest-status
+    routeConfigurationId: rest-errors
+    from:
+      uri: direct:rest-get
+      steps:
+        - bean:
+            ref: restHandlers
+            method: get
+
+- route:
+    id: fulfillment-rest-operator
+    routeConfigurationId: rest-errors
+    from:
+      uri: direct:rest-reconcile
+      steps:
+        - bean:
+            ref: restHandlers
+            method: reconcile
+
+- route:
+    id: fulfillment-rest-operator-bulk
+    routeConfigurationId: rest-errors
+    from:
+      uri: direct:rest-reconcile-bulk
+      steps:
+        - bean:
+            ref: restHandlers
+            method: reconcileAll

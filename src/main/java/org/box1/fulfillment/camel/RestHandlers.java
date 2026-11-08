@@ -16,6 +16,7 @@ import io.opentelemetry.api.trace.SpanContext;
 import io.quarkus.security.identity.SecurityIdentity;
 import io.quarkus.vertx.http.runtime.security.QuarkusHttpUser;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Named;
 import org.apache.camel.Exchange;
 import org.box1.fulfillment.ReconcileService;
 import org.box1.fulfillment.domain.AcceptanceResult;
@@ -31,9 +32,11 @@ import org.jboss.logging.MDC;
 /**
  * REST boundary processors. Authentication and roles are enforced before these run (HTTP permissions in
  * application.properties); these parse strictly, call the acceptance route and map outcomes to HTTP. Errors are
- * RFC 9457 problem documents that name fields, never values.
+ * RFC 9457 problem documents that name fields, never values. The REST routes in {@code routes/rest-api.camel.yaml}
+ * call these as {@code bean: restHandlers}.
  */
 @ApplicationScoped
+@Named("restHandlers")
 public class RestHandlers {
     private static final Logger LOG = Logger.getLogger(RestHandlers.class);
     private static final String PROBLEM = "application/problem+json";

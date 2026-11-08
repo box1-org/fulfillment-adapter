@@ -1,0 +1,196 @@
+# The ERP1 file exchange over SFTP. Every route here has a precondition: none is created unless
+# fulfillment.sftp.enabled is true; accepted requests stay queued meanwhile (D-007).
+# Key-based SFTP, strict host-key checking always on. Java steps: org.box1.fulfillment.camel.RouteSteps.
+
+# Route 2: dispatch. Claim due work, frame ERP1, upload to inbound/ as a temp name and rename. Each job is
+# independent; a failure records a bounded retry, never a business outcome.
+- route:
+    id: fulfillment-dispatch
+    precondition: "{{fulfillment.sftp.enabled}}"
+    from:
+      uri: scheduler:dispatch
+      parameters:
+        delay: "{{fulfillment.dispatch.poll-interval-ms}}"
+        initialDelay: 3000
+      steps:
+        - bean:
+            ref: routeSteps
+            method: claimUploads
+        - split:
+            simple: "${body}"
+            steps:
+              - setProperty:
+                  name: box1UploadJob
+                  simple: "${body}"
+              - setProperty:
+                  name: box1Uploaded
+                  constant:
+                    expression: "false"
+                    resultType: java.lang.Boolean
+              # After a connection-level failure the rest of the batch is given back without spending attempts.
+              - filter:
+                  method:
+                    ref: routeSteps
+                    method: endpointUp
+                  steps:
+                    # Only the framing and transfer are inside the catch: a failure to record success afterwards
+                    # must not be logged as a transport failure (the file was uploaded).
+                    - doTry:
+                        steps:
+                          - setHeader:
+                              name: CamelFileName
+                              simple: "${exchangeProperty.box1UploadJob.fileName()}"
+                          - setBody:
+                              simple: "${exchangeProperty.box1UploadJob.request()}"
+                          - marshal:
+                              custom:
+                                ref: erp1
+                          - to:
+                              uri: "sftp://{{fulfillment.sftp.host}}:{{fulfillment.sftp.port}}/inbound"
+                              parameters:
+                                username: "{{fulfillment.sftp.username}}"
+                                privateKeyFile: "{{fulfillment.sftp.private-key-file}}"
+                                knownHostsFile: "{{fulfillment.sftp.known-hosts-file}}"
+                                strictHostKeyChecking: "yes"
+                                useUserKnownHostsFile: false
+                                autoCreate: false
+                                binary: true
+                                connectTimeout: "{{fulfillment.sftp.connect-timeout-ms}}"
+                                timeout: "{{fulfillment.sftp.timeout-ms}}"
+                                serverAliveInterval: 15000
+                                serverAliveCountMax: 2
+                                tempFileName: ".${file:onlyname}.tmp"
+                                fileExist: Fail
+                                maximumReconnectAttempts: 0
+                                disconnect: true
+                          - setProperty:
+                              name: box1Uploaded
+                              constant:
+                                expression: "true"
+                                resultType: java.lang.Boolean
+                        doCatch:
+                          - exception:
+                              - java.lang.Exception
+                            steps:
+                              - bean:
+                                  ref: routeSteps
+                                  method: uploadFailed
+                    - filter:
+                        simple: "${exchangeProperty.box1Uploaded}"
+                        steps:
+                          - bean:
+                              ref: routeSteps
+                              method: uploadSucceeded
+        - bean:
+            ref: routeSteps
+            method: batchDone
+
+# Route 3: results. Read ready RES/ERR files from outbound/, commit, then move to consumed/. The move happens only
+# after the steps' transaction commits; an exception leaves the file in outbound/ for the next poll.
+- route:
+    id: erp-results
+    precondition: "{{fulfillment.sftp.enabled}}"
+    from:
+      uri: "sftp://{{fulfillment.sftp.host}}:{{fulfillment.sftp.port}}/outbound"
+      parameters:
+        username: "{{fulfillment.sftp.username}}"
+        privateKeyFile: "{{fulfillment.sftp.private-key-file}}"
+        knownHostsFile: "{{fulfillment.sftp.known-hosts-file}}"
+        strictHostKeyChecking: "yes"
+        useUserKnownHostsFile: false
+        autoCreate: false
+        binary: true
+        connectTimeout: "{{fulfillment.sftp.connect-timeout-ms}}"
+        timeout: "{{fulfillment.sftp.timeout-ms}}"
+        serverAliveInterval: 15000
+        serverAliveCountMax: 2
+        delay: "{{fulfillment.results.poll-interval-ms}}"
+        initialDelay: 4000
+        exclude: '^\..*\.tmp$'
+        recursive: false
+        maxMessagesPerPoll: 100
+        streamDownload: true
+        move: "../consumed/${header.box1ConsumedName}"
+        readLock: none
+        disconnect: false
+        throwExceptionOnConnectFailed: true
+        bridgeErrorHandler: true
+      steps:
+        - setHeader:
+            name: box1ConsumedName
+            method:
+              ref: routeSteps
+              method: consumedName
+        # Never read more than ERP1's maximum plus one byte: a huge file is quarantined, not loaded.
+        - bean:
+            ref: routeSteps
+            method: readHead
+        - choice:
+            when:
+              - method:
+                  ref: routeSteps
+                  method: readyName
+                steps:
+                  - doTry:
+                      steps:
+                        - unmarshal:
+                            custom:
+                              ref: erp1
+                        - bean:
+                            ref: routeSteps
+                            method: ingest
+                      doCatch:
+                        - exception:
+                            - org.box1.fulfillment.erp1.Erp1Exception
+                          steps:
+                            - bean:
+                                ref: routeSteps
+                                method: quarantineInvalid
+            otherwise:
+              steps:
+                - bean:
+                    ref: routeSteps
+                    method: quarantineUnexpectedName
+
+# Names starting with a dot are invisible to the results route; ERP1 still requires quarantining them.
+- route:
+    id: outbound-hidden-sweep
+    precondition: "{{fulfillment.sftp.enabled}}"
+    from:
+      uri: scheduler:hidden-sweep
+      parameters:
+        delay: "{{fulfillment.results.hidden-sweep-interval-ms}}"
+        initialDelay: 10000
+      steps:
+        - bean:
+            ref: routeSteps
+            method: sweepHidden
+
+# Retention: the adapter owns consumed/ and deletes its files after the retention period (D-011).
+- route:
+    id: consumed-retention
+    precondition: "{{fulfillment.sftp.enabled}}"
+    from:
+      uri: "sftp://{{fulfillment.sftp.host}}:{{fulfillment.sftp.port}}/consumed"
+      parameters:
+        username: "{{fulfillment.sftp.username}}"
+        privateKeyFile: "{{fulfillment.sftp.private-key-file}}"
+        knownHostsFile: "{{fulfillment.sftp.known-hosts-file}}"
+        strictHostKeyChecking: "yes"
+        useUserKnownHostsFile: false
+        autoCreate: false
+        binary: true
+        connectTimeout: "{{fulfillment.sftp.connect-timeout-ms}}"
+        timeout: "{{fulfillment.sftp.timeout-ms}}"
+        serverAliveInterval: 15000
+        serverAliveCountMax: 2
+        delay: "{{fulfillment.consumed.sweep-interval-ms}}"
+        initialDelay: 60000
+        download: false
+        delete: true
+        filter: "#consumedRetentionFilter"
+        recursive: false
+        maxMessagesPerPoll: 500
+      steps:
+        - log:
+            message: Deleted a consumed file past retention

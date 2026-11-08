@@ -104,8 +104,8 @@ public class HiddenFileSweeper {
         }
     }
 
-    /** Same rule as the result route: a plain, bounded name with no leading dot. */
-    static String safeName(String name) {
+    /** A plain, bounded name with no leading dot; the results route uses the same rule. */
+    public static String safeName(String name) {
         String plain = name.replaceAll("[^A-Za-z0-9._-]", "_");
         if (plain.startsWith(".")) {
             plain = "_" + plain.substring(1);

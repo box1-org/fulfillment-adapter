@@ -1,0 +1,26 @@
+# Routes that run with or without the ERP1 exchange. Java steps: org.box1.fulfillment.camel.RouteSteps.
+
+# Route 1: the single acceptance path for REST and Kafka commands. Commits before returning; exceptions propagate
+# to the caller.
+- route:
+    id: fulfillment-accept
+    from:
+      uri: direct:accept-command
+      steps:
+        - bean:
+            ref: routeSteps
+            method: accept
+
+# Route 4: reconciliation (acknowledgement deadlines, equivalent resends, needs-attention). Runs without SFTP too,
+# so deadlines and needs-attention stay current.
+- route:
+    id: fulfillment-reconcile
+    from:
+      uri: scheduler:reconcile
+      parameters:
+        delay: "{{fulfillment.reconcile.poll-interval-ms}}"
+        initialDelay: 5000
+      steps:
+        - bean:
+            ref: routeSteps
+            method: reconcile
