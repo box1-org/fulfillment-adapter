@@ -129,7 +129,7 @@ commands:
       label: "7. Containers: start the podman API for Testcontainers (-Pcontainers)"
       component: tools
       # Never fails the workspace start (older images lack the helper; container run may be off).
-      commandLine: box1-podman-socket start || echo "podman API not started; run: box1-podman-socket status"
+      commandLine: 'box1-podman-socket start || echo "podman API not started, see box1-podman-socket status"'
   - id: hawtio
     exec:
       label: "6. Hawtio: print the Hawtio Online console URL"
