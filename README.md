@@ -5,7 +5,7 @@ It durably accepts fulfillment requests, translates them into ERP1 legacy files,
 reconciles the ERP's results and publishes `shipment.confirmed.v1` and `shipment.failed.v1`. Apache Camel routes run
 inside this Quarkus application; there is no Camel K, no extra broker, and no HTTP call to the ERP.
 
-Owner: `user:default/mike4263`. Quarkus 3.40.1.1, Camel Quarkus 3.40.0 (Camel 4.22.1), Java 21.
+Owner: `user:default/mike`. Quarkus 3.40.1.1, Camel Quarkus 3.40.0 (Camel 4.22.1), Java 21.
 
 | Concern | Where |
 |---|---|
