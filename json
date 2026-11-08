@@ -1,0 +1,192 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    box1.org/remote-dev: "true"
+  name: fulfillment-adapter-remote-dev
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+  selector:
+    app.kubernetes.io/name: fulfillment-adapter-remote-dev
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    box1.org/remote-dev: "true"
+  name: fulfillment-adapter-remote-dev-postgres
+spec:
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres
+  selector:
+    box1.org/remote-dev-component: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    box1.org/remote-dev: "true"
+  name: fulfillment-adapter-remote-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fulfillment-adapter-remote-dev
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        alpha.image.policy.openshift.io/resolve-names: '*'
+        box1.org/jvm-debug: enabled
+      labels:
+        app.kubernetes.io/name: fulfillment-adapter-remote-dev
+        box1.org/remote-dev: "true"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - env:
+        - name: QUARKUS_LAUNCH_DEVMODE
+          value: "true"
+        - name: QUARKUS_LIVE_RELOAD_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: fulfillment-adapter-remote-dev-live-reload
+        - name: _JAVA_OPTIONS
+          value: -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:5005
+        - name: JAVA_TOOL_OPTIONS
+          value: -XX:MaxRAMPercentage=50.0 -Djava.io.tmpdir=/tmp
+        - name: QUARKUS_DATASOURCE_JDBC_URL
+          value: jdbc:postgresql://fulfillment-adapter-remote-dev-postgres:5432/fulfillment_adapter
+        - name: QUARKUS_DATASOURCE_USERNAME
+          value: fulfillment_adapter
+        - name: QUARKUS_DATASOURCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: fulfillment-adapter-remote-dev-live-reload
+        - name: FULFILLMENT_KAFKA_INPUT_ENABLED
+          value: "false"
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: localhost:9092
+        - name: FULFILLMENT_SFTP_ENABLED
+          value: "false"
+        - name: FULFILLMENT_READ_POLICY
+          value: permit
+        image: fulfillment-adapter:remote-dev
+        imagePullPolicy: Always
+        name: application
+        ports:
+        - containerPort: 8080
+          name: http
+        readinessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /q/health/ready
+            port: http
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: "1"
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    box1.org/remote-dev: "true"
+  name: fulfillment-adapter-remote-dev-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      box1.org/remote-dev-component: postgres
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        box1.org/remote-dev: "true"
+        box1.org/remote-dev-component: postgres
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - env:
+        - name: POSTGRESQL_DATABASE
+          value: fulfillment_adapter
+        - name: POSTGRESQL_USER
+          value: fulfillment_adapter
+        - name: POSTGRESQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: fulfillment-adapter-remote-dev-live-reload
+        image: registry.redhat.io/rhel9/postgresql-15@sha256:95e94264e14133d80ddbc9980eeebf4806d6668a61cbc1917e57efa1941b516b
+        name: postgres
+        ports:
+        - containerPort: 5432
+          name: postgres
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pg_isready -U "$POSTGRESQL_USER" -d "$POSTGRESQL_DATABASE"
+          periodSeconds: 5
+        resources:
+          limits:
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /var/lib/pgsql/data
+          name: data
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+      - emptyDir:
+          sizeLimit: 512Mi
+        name: data
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  labels:
+    box1.org/remote-dev: "true"
+  name: fulfillment-adapter-remote-dev
+spec:
+  port:
+    targetPort: http
+  tls:
+    insecureEdgeTerminationPolicy: Redirect
+    termination: edge
+  to:
+    kind: Service
+    name: fulfillment-adapter-remote-dev
