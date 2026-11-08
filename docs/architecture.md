@@ -38,7 +38,7 @@ A request has four facets that never collapse into one: `acceptance` (committed)
 `org.box1.fulfillment.erp1` implements ERP1 at the pinned contracts commit: framing (UTF-8 without BOM, LF, escapes,
 code-point lengths) and the SPEC §3 validation order in `Erp1Reader`; `Erp1Writer` reads every file back before it
 is uploaded. `Erp1ResultRules` is the §7 consumer table. Legacy records exist only in that package,
-`backend/LegacyErp1Backend` and `camel/Erp1DataFormat`; the modern domain never sees delimiters, ERP status codes or
+`backend/LegacyErp1Backend`, `backend/Erp1DataFormat` and the ERP1 exchange routes (`routes/erp1-exchange.camel.yaml`); the modern domain never sees delimiters, ERP status codes or
 exchange paths. Camel Bindy is not used, because ERP1 escaping and code-point lengths need their own framing (§9).
 
 ## Recovery by equivalent resend

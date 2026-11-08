@@ -5,6 +5,11 @@ It durably accepts fulfillment requests, translates them into ERP1 legacy files,
 reconciles the ERP's results and publishes `shipment.confirmed.v1` and `shipment.failed.v1`. Apache Camel routes run
 inside this Quarkus application; there is no Camel K, no extra broker, and no HTTP call to the ERP.
 
+The routes are Camel YAML DSL in [`src/main/resources/routes/`](src/main/resources/routes/), so Kaoto opens and edits
+them (in Dev Spaces too). Steps that need Java are methods on `camel/RouteSteps` and `camel/RestHandlers`, called as
+`bean` steps. The ERP1 exchange routes in `erp1-exchange.camel.yaml` have a `precondition` and are created only when
+`FULFILLMENT_SFTP_ENABLED` is true.
+
 Owner: `user:default/mike`. Quarkus 3.40.1.1, Camel Quarkus 3.40.0 (Camel 4.22.1), Java 21.
 
 | Concern | Where |
